@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-router-serving"
+version = "0.1.0"
+description = "FastAPI inference and retraining gateway for LLM Router"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "fastapi==0.141.1",
+  "google-cloud-aiplatform==1.164.0",
+  "google-cloud-storage==3.13.1",
+  "numpy==2.1.2",
+  "pyarrow==21.0.0",
+  "pydantic-settings==2.15.0",
+  "torch==2.5.1",
+  "transformers==4.48.3",
+  "uvicorn[standard]==0.52.3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "pytest==8.4.2",
+  "pytest-asyncio==0.26.0",
+  "ruff==0.16.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_router_serving"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
