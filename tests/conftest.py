@@ -9,6 +9,7 @@ from llm_router_serving.config import Settings
 from llm_router_serving.inference import (
     ClassificationResult,
     EmbeddingResult,
+    RerankResult,
 )
 from llm_router_serving.main import create_app
 from llm_router_serving.model_manager import ModelManager
@@ -38,6 +39,24 @@ class FakeClassifier:
         )
 
 
+class FakeReranker:
+    """Scores by shared-word overlap. Deterministic and dependency free.
+
+    The point of these tests is the contract (alignment, ordering, failure modes),
+    not the model. Real score fidelity is the offline evaluation's job.
+    """
+
+    model_version = "cross-encoder/quora-distilroberta-base@f62e7a4"
+
+    def rerank(self, query: str, candidates: list[str]) -> RerankResult:
+        query_words = set(query.lower().split())
+        scores = [
+            len(query_words & set(candidate.lower().split())) / max(len(query_words), 1)
+            for candidate in candidates
+        ]
+        return RerankResult(scores=scores, model_version=self.model_version)
+
+
 @dataclass
 class FakeEscalationService:
     calls: int = 0
@@ -64,18 +83,30 @@ def escalation_service():
     return FakeEscalationService()
 
 
-@pytest.fixture
-def client(settings, escalation_service):
+def _client(settings, escalation_service, *, rerank_engine=None):
     manager = ModelManager.loaded(
         embed_engine=FakeEmbedder(),
         router_engine=FakeClassifier(),
+        rerank_engine=rerank_engine,
     )
     app = create_app(
         settings=settings,
         model_manager=manager,
         escalation_service=escalation_service,
     )
-    with TestClient(app) as test_client:
+    return TestClient(app)
+
+
+@pytest.fixture
+def client(settings, escalation_service):
+    """Reranker disabled — the default deployment shape today."""
+    with _client(settings, escalation_service) as test_client:
+        yield test_client
+
+
+@pytest.fixture
+def rerank_client(settings, escalation_service):
+    with _client(settings, escalation_service, rerank_engine=FakeReranker()) as test_client:
         yield test_client
 
 
