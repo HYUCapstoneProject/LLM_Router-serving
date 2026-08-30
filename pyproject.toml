@@ -15,17 +15,6 @@ dependencies = [
   "numpy==2.1.2",
   "pyarrow==21.0.0",
   "pydantic-settings==2.15.0",
-  # Required by the cross-encoder reranker. The offline screening that produced
-  # the candidate threshold called CrossEncoder.predict, and that call decides the
-  # activation applied to the logits. Driving transformers directly here would
-  # shift the scores and invalidate the measured threshold.
-  #
-  # The version is pinned to the one the screening ran on
-  # (experiments/requirements-reranker.txt in the LLM_Router repository).
-  # A different release can change the default activation, which moves every
-  # score and silently invalidates the threshold. Bump this only together with
-  # a re-measurement.
-  "sentence-transformers==6.0.0",
   "torch==2.5.1",
   "transformers==4.48.3",
   "uvicorn[standard]==0.52.3",
