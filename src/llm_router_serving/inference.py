@@ -297,12 +297,14 @@ class SentenceTransformersCrossEncoderReranker:
             from sentence_transformers import CrossEncoder
 
         device = resolve_torch_device(torch, device_name)
-        model = CrossEncoder(
-            model_id,
-            device=str(device),
-            max_length=max_length,
-            cache_folder=str(cache_dir) if cache_dir is not None else None,
-        )
+        # Only pass cache_folder when a cache is actually configured. The image
+        # loads from a baked-in local path, and the keyword has moved between
+        # sentence-transformers releases, so sending it unconditionally turns a
+        # version bump into a startup failure.
+        kwargs: dict[str, Any] = {"device": str(device), "max_length": max_length}
+        if cache_dir is not None:
+            kwargs["cache_folder"] = str(cache_dir)
+        model = CrossEncoder(model_id, **kwargs)
         return cls(
             model=model,
             model_version=cls._resolve_version(model, model_id, model_version),
