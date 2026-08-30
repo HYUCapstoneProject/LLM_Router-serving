@@ -36,7 +36,9 @@ class Settings(BaseSettings):
     rerank_model_version: str | None = None
     rerank_max_length: int = 512
     rerank_max_candidates: int = 16
-    rerank_model_cache_dir: Path | None = None
+    # The image bakes the weights in and the runtime is HF_HUB_OFFLINE=1,
+    # so loading must never reach the network.
+    rerank_local_files_only: bool = True
 
     router_model_path: Path | None = None
     router_model_version: str | None = None

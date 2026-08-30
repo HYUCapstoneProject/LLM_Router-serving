@@ -254,7 +254,7 @@ class TransformersModernBertClassifier:
         )
 
 
-class SentenceTransformersCrossEncoderReranker:
+class TransformersCrossEncoderReranker:
     """Cross-encoder that rescores pgvector candidates against the query.
 
     The bi-encoder embeds each text on its own, so swapping one entity
@@ -263,22 +263,32 @@ class SentenceTransformersCrossEncoderReranker:
     out at 0.9371: the two classes overlap and no cosine threshold separates them.
     A cross-encoder reads both texts together, which is exactly the case it fixes.
 
-    **This deliberately uses ``sentence_transformers.CrossEncoder`` rather than
-    driving ``transformers`` directly.** The offline screening that produced the
-    candidate threshold called ``CrossEncoder.predict``, and that call decides the
-    activation applied to the logits. Reimplementing the head here would shift the
-    scores and silently invalidate the measured threshold, which is the one number
-    the whole evaluation exists to produce.
+    **Scoring must reproduce the offline screening exactly**, because the
+    candidate threshold was measured there and means nothing under a different
+    activation. The screening ran ``sentence_transformers.CrossEncoder.predict``,
+    which for a one-logit checkpoint applies a sigmoid — every recorded score sits
+    in [0, 1]. That is reproduced here directly rather than by depending on
+    sentence-transformers, whose current release requires transformers>=5 and
+    would drag the BGE embedder and the ModernBERT classifier along with it.
+
+    The equality is not assumed: ``scripts/verify_reranker_parity.py`` replays the
+    58 screening pairs against the stored scores.
     """
 
     def __init__(
         self,
         *,
+        tokenizer: Any,
         model: Any,
+        torch: Any,
+        device: Any,
         model_version: str,
         max_length: int,
     ) -> None:
+        self._tokenizer = tokenizer
         self._model = model
+        self._torch = torch
+        self._device = device
         self.model_version = model_version
         self._max_length = max_length
 
@@ -287,51 +297,61 @@ class SentenceTransformersCrossEncoderReranker:
         cls,
         *,
         model_id: str,
-        model_version: str,
+        model_version: str | None,
         max_length: int,
         device_name: str,
-        cache_dir: Path | None,
-    ) -> SentenceTransformersCrossEncoderReranker:
+        local_files_only: bool = True,
+    ) -> TransformersCrossEncoderReranker:
         with _TRANSFORMERS_IMPORT_LOCK:
             import torch
-            from sentence_transformers import CrossEncoder
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+        tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=local_files_only)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_id, local_files_only=local_files_only
+        )
+        cls._validate_single_logit(model.config)
         device = resolve_torch_device(torch, device_name)
-        # Only pass cache_folder when a cache is actually configured. The image
-        # loads from a baked-in local path, and the keyword has moved between
-        # sentence-transformers releases, so sending it unconditionally turns a
-        # version bump into a startup failure.
-        kwargs: dict[str, Any] = {"device": str(device), "max_length": max_length}
-        if cache_dir is not None:
-            kwargs["cache_folder"] = str(cache_dir)
-        model = CrossEncoder(model_id, **kwargs)
+        model.to(device)
+        model.eval()
         return cls(
+            tokenizer=tokenizer,
             model=model,
-            model_version=cls._resolve_version(model, model_id, model_version),
+            torch=torch,
+            device=device,
+            model_version=model_version or model_id,
             max_length=max_length,
         )
 
     @staticmethod
-    def _resolve_version(model: Any, model_id: str, configured: str | None) -> str:
-        """Prefer the checkpoint commit hash over a human-typed version string.
+    def _validate_single_logit(config: Any) -> None:
+        """A sigmoid over logit 0 is only meaningful for a one-logit head.
 
-        A threshold is only valid for the exact weights it was measured on, so the
-        value the gateway logs has to change whenever the weights do.
+        Swap in a two-label checkpoint and the scores would still look plausible
+        while meaning something else entirely, so refuse to load it.
         """
-        if configured:
-            return configured
-        config = getattr(getattr(model, "model", None), "config", None)
-        revision = getattr(config, "_commit_hash", None)
-        return f"{model_id}@{revision}" if revision else model_id
+        num_labels = int(getattr(config, "num_labels", 0))
+        if num_labels != 1:
+            raise ModelContractError(
+                f"reranker checkpoint must expose exactly one logit; found {num_labels}"
+            )
 
     def rerank(self, query: str, candidates: list[str]) -> RerankResult:
-        pairs = [(query, candidate) for candidate in candidates]
-        output = self._model.predict(pairs, batch_size=len(pairs), show_progress_bar=False)
+        inputs = self._tokenizer(
+            [query] * len(candidates),
+            candidates,
+            padding=True,
+            truncation=True,
+            max_length=self._max_length,
+            return_tensors="pt",
+        )
+        inputs = {name: value.to(self._device) for name, value in inputs.items()}
+        with self._torch.inference_mode():
+            logits = self._model(**inputs).logits
+            probabilities = self._torch.sigmoid(logits[:, 0])
 
         scores: list[float] = []
-        for value in output:
-            if hasattr(value, "item"):
-                value = value.item()
+        for value in probabilities.tolist():
             score = float(value)
             if not math.isfinite(score):
                 # A NaN would compare false against any threshold and turn into a

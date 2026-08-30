@@ -17,7 +17,7 @@ from llm_router_serving.inference import (
     ClassificationEngine,
     EmbeddingEngine,
     RerankEngine,
-    SentenceTransformersCrossEncoderReranker,
+    TransformersCrossEncoderReranker,
     TransformersBgeEmbedder,
     TransformersModernBertClassifier,
 )
@@ -116,12 +116,12 @@ def _build_model_manager(settings: Settings) -> ModelManager:
         )
 
     def load_rerank() -> RerankEngine:
-        return SentenceTransformersCrossEncoderReranker.load(
+        return TransformersCrossEncoderReranker.load(
             model_id=str(settings.rerank_model_id),
             model_version=settings.rerank_model_version,
             max_length=settings.rerank_max_length,
             device_name=settings.model_device,
-            cache_dir=settings.rerank_model_cache_dir,
+            local_files_only=settings.rerank_local_files_only,
         )
 
     return ModelManager(
