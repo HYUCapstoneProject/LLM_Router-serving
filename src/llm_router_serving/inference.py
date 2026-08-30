@@ -31,6 +31,12 @@ class ClassificationResult:
     model_version: str
 
 
+@dataclass(frozen=True)
+class RerankResult:
+    scores: list[float]
+    model_version: str
+
+
 class EmbeddingEngine(Protocol):
     dimension: int
     model_version: str
@@ -42,6 +48,12 @@ class ClassificationEngine(Protocol):
     model_version: str
 
     def classify(self, message: str) -> ClassificationResult: ...
+
+
+class RerankEngine(Protocol):
+    model_version: str
+
+    def rerank(self, query: str, candidates: list[str]) -> RerankResult: ...
 
 
 def resolve_torch_device(torch: Any, configured: str) -> Any:
@@ -240,3 +252,93 @@ class TransformersModernBertClassifier:
             confidence=confidence,
             model_version=self.model_version,
         )
+
+
+class SentenceTransformersCrossEncoderReranker:
+    """Cross-encoder that rescores pgvector candidates against the query.
+
+    The bi-encoder embeds each text on its own, so swapping one entity
+    (Python to Java, insertion to deletion) barely moves the vector. Measured on
+    92 questions, paraphrases bottomed out at 0.8621 while hard negatives topped
+    out at 0.9371: the two classes overlap and no cosine threshold separates them.
+    A cross-encoder reads both texts together, which is exactly the case it fixes.
+
+    **This deliberately uses ``sentence_transformers.CrossEncoder`` rather than
+    driving ``transformers`` directly.** The offline screening that produced the
+    candidate threshold called ``CrossEncoder.predict``, and that call decides the
+    activation applied to the logits. Reimplementing the head here would shift the
+    scores and silently invalidate the measured threshold, which is the one number
+    the whole evaluation exists to produce.
+    """
+
+    def __init__(
+        self,
+        *,
+        model: Any,
+        model_version: str,
+        max_length: int,
+    ) -> None:
+        self._model = model
+        self.model_version = model_version
+        self._max_length = max_length
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        model_id: str,
+        model_version: str,
+        max_length: int,
+        device_name: str,
+        cache_dir: Path | None,
+    ) -> SentenceTransformersCrossEncoderReranker:
+        with _TRANSFORMERS_IMPORT_LOCK:
+            import torch
+            from sentence_transformers import CrossEncoder
+
+        device = resolve_torch_device(torch, device_name)
+        model = CrossEncoder(
+            model_id,
+            device=str(device),
+            max_length=max_length,
+            cache_folder=str(cache_dir) if cache_dir is not None else None,
+        )
+        return cls(
+            model=model,
+            model_version=cls._resolve_version(model, model_id, model_version),
+            max_length=max_length,
+        )
+
+    @staticmethod
+    def _resolve_version(model: Any, model_id: str, configured: str | None) -> str:
+        """Prefer the checkpoint commit hash over a human-typed version string.
+
+        A threshold is only valid for the exact weights it was measured on, so the
+        value the gateway logs has to change whenever the weights do.
+        """
+        if configured:
+            return configured
+        config = getattr(getattr(model, "model", None), "config", None)
+        revision = getattr(config, "_commit_hash", None)
+        return f"{model_id}@{revision}" if revision else model_id
+
+    def rerank(self, query: str, candidates: list[str]) -> RerankResult:
+        pairs = [(query, candidate) for candidate in candidates]
+        output = self._model.predict(pairs, batch_size=len(pairs), show_progress_bar=False)
+
+        scores: list[float] = []
+        for value in output:
+            if hasattr(value, "item"):
+                value = value.item()
+            score = float(value)
+            if not math.isfinite(score):
+                # A NaN would compare false against any threshold and turn into a
+                # silent cache miss. Fail loudly so the caller records the reason.
+                raise ModelContractError("reranker returned a non-finite score")
+            scores.append(score)
+
+        if len(scores) != len(candidates):
+            raise ModelContractError(
+                f"reranker returned {len(scores)} scores for {len(candidates)} candidates"
+            )
+        return RerankResult(scores=scores, model_version=self.model_version)

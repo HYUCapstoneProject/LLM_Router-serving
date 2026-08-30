@@ -28,6 +28,43 @@ class EmbedResponse(StrictModel):
     modelVersion: str
 
 
+class RerankRequest(StrictModel):
+    """Gateway sends one query with the pgvector candidates it already retrieved.
+
+    The gateway holds the cache and decides hit or miss. This endpoint only
+    scores pairs; it never sees the threshold and never returns a decision.
+    """
+
+    query: str = Field(min_length=1)
+    candidates: list[str] = Field(min_length=1, max_length=32)
+
+    @field_validator("query")
+    @classmethod
+    def reject_blank_query(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("query must not be blank")
+        return value
+
+    @field_validator("candidates")
+    @classmethod
+    def reject_blank_candidates(cls, value: list[str]) -> list[str]:
+        if any(not candidate.strip() for candidate in value):
+            raise ValueError("candidates must not contain blank entries")
+        return value
+
+
+class RerankResponse(StrictModel):
+    """`scores` is positionally aligned with the request `candidates`.
+
+    Score ranges are model specific: a sigmoid model lands in [0, 1] while a raw
+    logit model does not. The caller must tie its threshold to `modelVersion`
+    and re-measure whenever that value changes. Never compare scores across models.
+    """
+
+    scores: list[float]
+    modelVersion: str
+
+
 class Tier(StrEnum):
     EASY = "easy"
     MEDIUM = "medium"
@@ -58,10 +95,22 @@ class HealthStatus(StrEnum):
     NOT_READY = "not_ready"
 
 
+class ModelLoadStatusOrDisabled(StrEnum):
+    LOADED = "loaded"
+    LOADING = "loading"
+    ERROR = "error"
+    DISABLED = "disabled"
+
+
 class HealthResponse(StrictModel):
     status: HealthStatus
     embedModel: ModelLoadStatus
     routerModel: ModelLoadStatus
+    # Readiness deliberately ignores this field. The reranker is an optional
+    # precision layer; if it is missing the gateway falls back to the cosine
+    # threshold it already uses, and taking the whole service down for that
+    # would trade a small quality loss for a total outage.
+    rerankModel: ModelLoadStatusOrDisabled = ModelLoadStatusOrDisabled.DISABLED
 
 
 class EscalateRequest(StrictModel):

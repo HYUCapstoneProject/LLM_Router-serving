@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     embed_max_length: int = 512
     embed_local_files_only: bool = False
 
+    # Optional cross-encoder reranker. Leave `rerank_model_id` unset to disable it;
+    # the service then reports rerankModel=disabled and /router/rerank returns 503.
+    # Screening picked cross-encoder/quora-distilroberta-base as the leading
+    # candidate but no model met the false-hit gate, so nothing is enabled by default.
+    rerank_model_id: str | None = None
+    # Pin this to the exact checkpoint the threshold was measured on. A threshold
+    # is only meaningful for one set of weights.
+    rerank_model_version: str | None = None
+    rerank_max_length: int = 512
+    rerank_max_candidates: int = 16
+    rerank_model_cache_dir: Path | None = None
+
     router_model_path: Path | None = None
     router_model_version: str | None = None
     model_code_commit: str | None = None

@@ -16,6 +16,8 @@ from llm_router_serving.errors import ApiError, ModelContractError
 from llm_router_serving.inference import (
     ClassificationEngine,
     EmbeddingEngine,
+    RerankEngine,
+    SentenceTransformersCrossEncoderReranker,
     TransformersBgeEmbedder,
     TransformersModernBertClassifier,
 )
@@ -49,6 +51,8 @@ from llm_router_serving.schemas import (
     HealthStatus,
     MessageRequest,
     ModelLoadStatus,
+    RerankRequest,
+    RerankResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,7 +115,20 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             device_name=settings.model_device,
         )
 
-    return ModelManager(embed_loader=load_embed, router_loader=load_router)
+    def load_rerank() -> RerankEngine:
+        return SentenceTransformersCrossEncoderReranker.load(
+            model_id=str(settings.rerank_model_id),
+            model_version=settings.rerank_model_version,
+            max_length=settings.rerank_max_length,
+            device_name=settings.model_device,
+            cache_dir=settings.rerank_model_cache_dir,
+        )
+
+    return ModelManager(
+        embed_loader=load_embed,
+        router_loader=load_router,
+        rerank_loader=load_rerank if settings.rerank_model_id else None,
+    )
 
 
 def _build_escalation_service(settings: Settings) -> EscalationService | None:
@@ -290,6 +307,54 @@ def create_app(
             modelVersion=result.model_version,
         )
 
+    @app.post(
+        "/router/rerank",
+        response_model=RerankResponse,
+        responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    )
+    async def rerank(payload: RerankRequest, _: InternalAuth) -> RerankResponse:
+        """Score query-candidate pairs. The caller keeps the hit/miss decision.
+
+        The gateway owns the cache and the threshold, so this returns raw scores
+        and never a verdict. Scores are positionally aligned with `candidates`.
+        """
+        validate_message_length(payload.query)
+        for candidate in payload.candidates:
+            validate_message_length(candidate)
+        if len(payload.candidates) > settings.rerank_max_candidates:
+            raise ApiError(
+                status.HTTP_400_BAD_REQUEST,
+                "TOO_MANY_CANDIDATES",
+                f"candidates must not exceed {settings.rerank_max_candidates}",
+            )
+
+        engine = model_manager.rerank_engine()
+        if engine is None:
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "RERANK_MODEL_NOT_READY",
+                "reranker model is not loaded",
+            )
+        try:
+            result = await asyncio.to_thread(engine.rerank, payload.query, payload.candidates)
+        except ModelContractError as exc:
+            # A non-finite score compares false against every threshold and would
+            # become a silent cache miss. Surface it so the caller can log why.
+            logger.error("Rerank contract violation: %s", exc)
+            raise ApiError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "RERANK_INFERENCE_FAILED",
+                "reranker output violates the serving contract",
+            ) from exc
+        except Exception as exc:
+            logger.exception("Rerank inference failed")
+            raise ApiError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "RERANK_INFERENCE_FAILED",
+                "rerank inference failed",
+            ) from exc
+        return RerankResponse(scores=result.scores, modelVersion=result.model_version)
+
     @app.get(
         "/health",
         response_model=HealthResponse,
@@ -303,10 +368,13 @@ def create_app(
         )
         if not ready:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        # `ready` deliberately excludes the reranker: it is an optional precision
+        # layer and the gateway already falls back to the cosine threshold without it.
         return HealthResponse(
             status=HealthStatus.OK if ready else HealthStatus.NOT_READY,
             embedModel=snapshot.embed_status,
             routerModel=snapshot.router_status,
+            rerankModel=snapshot.rerank_status,
         )
 
     @app.post(

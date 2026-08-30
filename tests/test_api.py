@@ -69,6 +69,8 @@ def test_health_returns_ok_when_both_models_are_loaded(client):
         "status": "ok",
         "embedModel": "loaded",
         "routerModel": "loaded",
+        # Reranker is optional and off by default; readiness must not depend on it.
+        "rerankModel": "disabled",
     }
 
 
@@ -91,6 +93,8 @@ def test_health_returns_503_while_models_are_loading(settings, escalation_servic
         "status": "not_ready",
         "embedModel": "loading",
         "routerModel": "loading",
+        # Optional layer, absent unless rerank_model_id is configured.
+        "rerankModel": "disabled",
     }
 
 
