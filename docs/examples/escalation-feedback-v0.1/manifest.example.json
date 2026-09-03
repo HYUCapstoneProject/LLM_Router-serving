@@ -1,0 +1,13 @@
+{
+  "schema_version": "feedback-export-v0.1",
+  "batch_id": "feedback-20260912-0001",
+  "created_at": "2026-09-12T06:29:58Z",
+  "window_start": "2026-09-12T05:14:22Z",
+  "window_end": "2026-09-12T06:27:41Z",
+  "event_count": 3,
+  "data_format": "parquet",
+  "data_uri": "gs://llm-router-mlserver/datasets/feedback/feedback-20260912-0001/events.parquet",
+  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "producer_version": "spring-feedback-exporter-1.0.0",
+  "watermark": "284391"
+}

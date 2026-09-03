@@ -1,0 +1,8 @@
+{
+  "batchId": "feedback-20260912-0001",
+  "schemaVersion": "feedback-export-v0.1",
+  "manifestUri": "gs://llm-router-mlserver/datasets/feedback/feedback-20260912-0001/manifest.json",
+  "eventsUri": "gs://llm-router-mlserver/datasets/feedback/feedback-20260912-0001/events.parquet",
+  "eventCount": 3,
+  "requestedAt": "2026-09-12T06:30:00Z"
+}
