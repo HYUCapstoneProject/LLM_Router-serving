@@ -1,10 +1,9 @@
 """Resolve the router model directory that this process should serve.
 
-Model delivery is pull-based. The Vertex AI pipeline publishes a package to GCS
-and a human approves it; deployment then passes the approved package URI and
-version to this process. Startup downloads and verifies the package, so a rolling
-restart is what swaps the serving model. There is no runtime endpoint that
-replaces a loaded model.
+Model delivery is pull-based. The Vertex AI pipeline publishes and automatically
+approves a gate-passed package, then atomically updates ``CURRENT.json``. The
+serving process reads that pointer at startup and polls it while running. A new
+package is downloaded and verified before the in-memory classifier is swapped.
 
 Verification mirrors the ML-side ``model-package-v1`` contract: the manifest must
 be approved, its schema and labels must match, and every listed file must match
@@ -16,8 +15,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 from urllib.parse import urlparse
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 MANIFEST_FILENAME = "model_manifest.json"
 PACKAGE_SCHEMA_VERSION = "model-package-v1"
+CURRENT_POINTER_SCHEMA_VERSION = "router-current-model-v1"
 EXPECTED_ID2LABEL = {"0": "easy", "1": "medium", "2": "hard"}
 REQUIRED_PACKAGE_FILES = frozenset(
     {
@@ -50,7 +52,20 @@ class ResolvedModel:
     package_uri: str | None
 
 
+@dataclass(frozen=True)
+class CurrentModelPointer:
+    model_version: str
+    package_uri: str
+    manifest_sha256: str
+    logical_model_version: str | None = None
+    training_mode: str | None = None
+    previous_model_version: str | None = None
+    approved_at: datetime | None = None
+
+
 class PackageObjectStore(Protocol):
+    def read_bytes(self, uri: str) -> bytes: ...
+
     def list_uris(self, prefix_uri: str) -> list[str]: ...
 
     def download_file(self, source_uri: str, destination: Path) -> None: ...
@@ -81,6 +96,15 @@ class GcsPackageStore:
         blobs = self._get_client().list_blobs(bucket_name, prefix=normalized)
         return sorted(f"gs://{bucket_name}/{blob.name}" for blob in blobs)
 
+    def read_bytes(self, uri: str) -> bytes:
+        bucket_name, object_name = split_gcs_uri(uri)
+        return (
+            self._get_client()
+            .bucket(bucket_name)
+            .blob(object_name)
+            .download_as_bytes(checksum="auto")
+        )
+
     def download_file(self, source_uri: str, destination: Path) -> None:
         bucket_name, object_name = split_gcs_uri(source_uri)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -94,6 +118,88 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
         while chunk := handle.read(chunk_size):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def read_current_model_pointer(
+    pointer_uri: str,
+    *,
+    object_store: PackageObjectStore | None = None,
+) -> CurrentModelPointer:
+    """Read and validate the atomic pointer written by the promotion pipeline."""
+    bucket, object_name = split_gcs_uri(pointer_uri)
+    if not object_name.endswith("/CURRENT.json") and object_name != "CURRENT.json":
+        raise ModelSourceError("Current model pointer URI must end with CURRENT.json")
+    store = object_store or GcsPackageStore()
+    try:
+        payload = json.loads(store.read_bytes(pointer_uri))
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
+        raise ModelSourceError("CURRENT.json is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ModelSourceError("CURRENT.json must contain a JSON object")
+    if payload.get("schema_version") != CURRENT_POINTER_SCHEMA_VERSION:
+        raise ModelSourceError(
+            f"Unsupported CURRENT.json schema: {payload.get('schema_version')!r}"
+        )
+
+    model_version = str(payload.get("model_version", "")).strip()
+    package_uri = str(payload.get("package_uri", "")).rstrip("/")
+    manifest_sha256 = str(payload.get("manifest_sha256", "")).removeprefix("sha256:").lower()
+    if not re.fullmatch(r"router-[a-z0-9._-]+", model_version):
+        raise ModelSourceError("CURRENT.json model_version is not a safe router version")
+    package_bucket, package_prefix = split_gcs_uri(package_uri)
+    pointer_root = object_name.rsplit("/", 1)[0] if "/" in object_name else ""
+    expected_package_prefix = "/".join(
+        part for part in (pointer_root.rstrip("/"), model_version, "approved") if part
+    )
+    if package_bucket != bucket or package_prefix != expected_package_prefix:
+        raise ModelSourceError(
+            "CURRENT.json package_uri must be <pointer-root>/<model_version>/approved"
+        )
+    if payload.get("id2label") != EXPECTED_ID2LABEL:
+        raise ModelSourceError("CURRENT.json labels must be easy=0, medium=1, hard=2")
+    if len(manifest_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in manifest_sha256
+    ):
+        raise ModelSourceError("CURRENT.json manifest_sha256 must be a SHA-256 digest")
+    logical_model_version = _optional_string(payload.get("logical_model_version"))
+    if logical_model_version and not re.fullmatch(r"[0-9]+[.][0-9]+", logical_model_version):
+        raise ModelSourceError("CURRENT.json logical_model_version must be <major>.<minor>")
+    training_mode = _optional_string(payload.get("training_mode"))
+    if training_mode not in {None, "minor_fine_tune", "major_consolidation", "pristine_rebase"}:
+        # The original qualification pointer used `initial_training`; expose it
+        # as unknown rather than making an otherwise valid baseline unloadable.
+        training_mode = None
+    previous_model_version = _optional_string(payload.get("previous_model_version"))
+    if previous_model_version and not re.fullmatch(r"router-[a-z0-9._-]+", previous_model_version):
+        raise ModelSourceError("CURRENT.json previous_model_version is not safe")
+    approved_at = _optional_datetime(payload.get("approved_at"))
+    return CurrentModelPointer(
+        model_version=model_version,
+        package_uri=package_uri,
+        manifest_sha256=manifest_sha256,
+        logical_model_version=logical_model_version,
+        training_mode=training_mode,
+        previous_model_version=previous_model_version,
+        approved_at=approved_at,
+    )
+
+
+def _optional_string(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _optional_datetime(value: object) -> datetime | None:
+    text = _optional_string(value)
+    if text is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ModelSourceError("CURRENT.json approved_at is not a valid timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ModelSourceError("CURRENT.json approved_at must include a timezone")
+    return parsed.astimezone(UTC)
 
 
 def verify_package(
@@ -189,6 +295,7 @@ def resolve_router_model(
     cache_dir: Path,
     object_store: PackageObjectStore | None = None,
     require_approved: bool = True,
+    expected_manifest_sha256: str | None = None,
 ) -> ResolvedModel:
     """Return the local directory holding the verified router model.
 
@@ -217,6 +324,7 @@ def resolve_router_model(
             expected_model_version=model_version,
             require_approved=require_approved,
         )
+        _verify_expected_manifest_sha256(target, expected_manifest_sha256)
         return ResolvedModel(path=target, model_version=model_version, package_uri=package_uri)
 
     store = object_store or GcsPackageStore()
@@ -230,6 +338,7 @@ def resolve_router_model(
         expected_model_version=model_version,
         require_approved=require_approved,
     )
+    _verify_expected_manifest_sha256(staging, expected_manifest_sha256)
 
     if target.exists():
         shutil.rmtree(target)
@@ -240,3 +349,16 @@ def resolve_router_model(
     marker.write_text(package_uri, encoding="utf-8")
     logger.info("Router model package %s is ready at %s", model_version, target)
     return ResolvedModel(path=target, model_version=model_version, package_uri=package_uri)
+
+
+def _verify_expected_manifest_sha256(
+    package_dir: Path, expected_manifest_sha256: str | None
+) -> None:
+    if expected_manifest_sha256 is None:
+        return
+    expected = expected_manifest_sha256.removeprefix("sha256:").lower()
+    actual = _sha256_file(package_dir / MANIFEST_FILENAME)
+    if actual != expected:
+        raise ModelSourceError(
+            f"Model manifest SHA-256 mismatch: expected {expected}, got {actual}"
+        )

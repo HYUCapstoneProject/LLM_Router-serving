@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -17,6 +18,8 @@ class Settings(BaseSettings):
 
     app_name: str = "LLM Router Serving"
     internal_api_token: SecretStr | None = None
+    enable_developer_api: bool = False
+    developer_api_token: SecretStr | None = None
     max_message_characters: int = 100_000
 
     embed_model_id: str = "BAAI/bge-large-en-v1.5"
@@ -47,18 +50,30 @@ class Settings(BaseSettings):
     model_device: str = "auto"
     load_models_on_startup: bool = True
 
-    # Approved model delivery. The pipeline publishes to GCS; deployment passes the
-    # approved URI and version here and the process downloads them during startup.
+    # Approved model delivery. Deployment follows CURRENT.json by default; a fixed
+    # approved URI/version remains available for pinned or rollback deployments.
     router_model_package_uri: str | None = None
+    router_model_current_pointer_uri: str | None = None
     router_model_cache_dir: Path = Path("var/models")
     router_model_require_approved: bool = True
+    router_model_auto_reload: bool = True
+    router_model_poll_interval_seconds: float = 60.0
 
     retraining_db_path: Path = Path("var/retraining.sqlite3")
     # How old an unsubmitted lease must be before it is reconciled against
     # Vertex. Submission takes seconds; this only has to outlast a slow call.
     retraining_stale_submission_seconds: int = 900
+    retraining_initial_logical_major: int = 1
+    # The call-count trigger is intentional for the current research phase.
+    retraining_calls_per_major: int = 3
+    retraining_rebase_every_major_cycles: int = 5
+    retraining_replay_rows_per_label: int = 32
+    retraining_version_policy_mode: str = "successfulHttpRequest"
+    retraining_derived_data_root_uri: str | None = None
+    retraining_observability_root_uri: str | None = None
+    retraining_control_root_uri: str | None = None
     allowed_gcs_buckets: Annotated[tuple[str, ...], NoDecode] = ()
-    supported_feedback_schemas: Annotated[tuple[str, ...], NoDecode] = ("feedback-export-v0.1",)
+    supported_feedback_schemas: Annotated[tuple[str, ...], NoDecode] = ("feedback-inline-v1",)
 
     vertex_project: str | None = None
     vertex_location: str = "us-west1"
@@ -88,11 +103,14 @@ class Settings(BaseSettings):
 
     @field_validator(
         "embed_model_revision",
+        "developer_api_token",
         # Without this an unset `LLM_ROUTER_ROUTER_MODEL_PATH=` parses as
         # Path("") == Path("."), which reads as a configured local source and
         # collides with the package URI.
         "router_model_path",
         "router_model_package_uri",
+        "router_model_current_pointer_uri",
+        "router_model_version",
         "vertex_project",
         "vertex_pipeline_template_uri",
         "vertex_pipeline_root",
@@ -101,6 +119,9 @@ class Settings(BaseSettings):
         "vertex_training_service_account",
         "vertex_training_output_directory",
         "model_publish_root_uri",
+        "retraining_derived_data_root_uri",
+        "retraining_observability_root_uri",
+        "retraining_control_root_uri",
         mode="before",
     )
     @classmethod
@@ -123,36 +144,106 @@ class Settings(BaseSettings):
             "package_metadata_uri": self.package_metadata_uri,
             "baseline_metrics_uri": self.baseline_metrics_uri,
             "gate_rules_uri": self.gate_rules_uri,
+            "model_publish_root_uri": self.model_publish_root_uri,
+            "retraining_derived_data_root_uri": self.retraining_derived_data_root_uri,
+            "retraining_observability_root_uri": self.retraining_observability_root_uri,
             "router_model_version": self.router_model_version,
             "model_code_commit": self.model_code_commit,
         }
         missing = [name for name, value in required.items() if value in (None, "")]
         if not self.allowed_gcs_buckets:
             missing.append("allowed_gcs_buckets")
-        for name in ("vertex_pipeline_template_uri", "vertex_pipeline_root"):
+        for name in (
+            "vertex_pipeline_template_uri",
+            "vertex_pipeline_root",
+            "model_publish_root_uri",
+        ):
             value = getattr(self, name)
             if value and not str(value).startswith("gs://"):
                 missing.append(f"{name}(must be a gs:// URI)")
+        derived_uri = self.derived_retraining_data_root_uri()
+        if derived_uri and not derived_uri.startswith("gs://"):
+            missing.append("retraining_derived_data_root_uri(must be a gs:// URI)")
+        elif derived_uri and urlparse(derived_uri).netloc not in self.allowed_gcs_buckets:
+            missing.append("retraining_derived_data_root_uri(bucket must be allowed)")
+        for name in (
+            "retraining_observability_root_uri",
+            "retraining_control_root_uri",
+        ):
+            value = getattr(self, name)
+            if value and not str(value).startswith("gs://"):
+                missing.append(f"{name}(must be a gs:// URI)")
+            elif value and urlparse(str(value)).netloc not in self.allowed_gcs_buckets:
+                missing.append(f"{name}(bucket must be allowed)")
+        if (
+            self.retraining_version_policy_mode == "validatedUniqueBatch"
+            and not self.retraining_control_root_uri
+        ):
+            missing.append("retraining_control_root_uri")
+        if self.retraining_calls_per_major != 3:
+            missing.append("retraining_calls_per_major(must currently equal 3)")
+        if self.retraining_initial_logical_major < 0:
+            missing.append("retraining_initial_logical_major(must be non-negative)")
+        if self.retraining_rebase_every_major_cycles < 1:
+            missing.append("retraining_rebase_every_major_cycles(must be positive)")
+        if self.retraining_replay_rows_per_label < 1:
+            missing.append("retraining_replay_rows_per_label(must be positive)")
         return missing
+
+    def developer_configuration_errors(self) -> list[str]:
+        if self.enable_developer_api and self.developer_api_token is None:
+            return ["developer_api_token"]
+        return []
+
+    def derived_retraining_data_root_uri(self) -> str | None:
+        if self.retraining_derived_data_root_uri:
+            return self.retraining_derived_data_root_uri.rstrip("/")
+        return None
+
+    def initial_approved_model_uri(self) -> str | None:
+        if self.router_model_package_uri:
+            return self.router_model_package_uri.rstrip("/")
+        if self.model_publish_root_uri and self.router_model_version:
+            return f"{self.model_publish_root_uri.rstrip('/')}/{self.router_model_version}/approved"
+        return None
 
     def router_model_source_errors(self) -> list[str]:
         """Validate the approved-model source that startup downloads from GCS.
 
-        Exactly one source must be configured: a local directory for development,
-        or a GCS package URI for deployment. Both, or neither, is ambiguous.
+        A local directory is used for development. Deployment may use either a
+        fixed approved GCS package or CURRENT.json; when both remote values are
+        configured, CURRENT.json is authoritative.
         """
         has_local = self.router_model_path is not None
         has_remote = self.router_model_package_uri is not None
+        pointer_uri = self.current_model_pointer_uri()
+        has_pointer = pointer_uri is not None
         errors: list[str] = []
-        if has_local and has_remote:
-            errors.append("router_model_path and router_model_package_uri are mutually exclusive")
-        if not has_local and not has_remote:
-            errors.append("router_model_path or router_model_package_uri must be set")
+        if has_local and (has_remote or has_pointer):
+            errors.append(
+                "router_model_path cannot be combined with a GCS package or CURRENT pointer"
+            )
+        if not has_local and not has_remote and not has_pointer:
+            errors.append(
+                "router_model_path, router_model_package_uri, or "
+                "router_model_current_pointer_uri must be set"
+            )
         if has_remote and not str(self.router_model_package_uri).startswith("gs://"):
             errors.append("router_model_package_uri must be a gs:// URI")
-        if not self.router_model_version:
+        if has_pointer and not str(pointer_uri).startswith("gs://"):
+            errors.append("router_model_current_pointer_uri must be a gs:// URI")
+        if not has_pointer and not self.router_model_version:
             errors.append("router_model_version must be set")
+        if self.router_model_poll_interval_seconds <= 0:
+            errors.append("router_model_poll_interval_seconds must be positive")
         return errors
+
+    def current_model_pointer_uri(self) -> str | None:
+        if self.router_model_current_pointer_uri:
+            return self.router_model_current_pointer_uri
+        if self.model_publish_root_uri and self.router_model_path is None:
+            return f"{self.model_publish_root_uri.rstrip('/')}/CURRENT.json"
+        return None
 
     @field_validator("model_code_commit")
     @classmethod
@@ -165,9 +256,19 @@ class Settings(BaseSettings):
     @classmethod
     def validate_router_model_version(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(
-            r"router-[a-z0-9._-]+-\d{8}-[0-9a-fA-F]{7,40}", value
+            r"router-[a-z0-9._-]+-\d{8}(?:-[0-9a-fA-F]{8})?-[0-9a-fA-F]{7,40}",
+            value,
         ):
             raise ValueError(
-                "router_model_version must follow router-{model}-{dataset}-{date}-{shortCommit}"
+                "router_model_version must follow router-{model}-{dataset}-{date}-"
+                "[{batchDigest}-]{shortCommit}"
             )
+        return value
+
+    @field_validator("retraining_version_policy_mode")
+    @classmethod
+    def validate_version_policy_mode(cls, value: str) -> str:
+        allowed = {"successfulHttpRequest", "validatedUniqueBatch"}
+        if value not in allowed:
+            raise ValueError(f"retraining_version_policy_mode must be one of {sorted(allowed)}")
         return value

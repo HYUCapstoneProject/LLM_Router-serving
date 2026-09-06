@@ -8,6 +8,7 @@ import pytest
 
 from llm_router_serving.model_source import (
     ModelSourceError,
+    read_current_model_pointer,
     resolve_router_model,
     verify_package,
 )
@@ -54,6 +55,10 @@ class MemoryPackageStore:
     def list_uris(self, prefix_uri: str) -> list[str]:
         assert prefix_uri.rstrip("/") == self._prefix
         return sorted(f"{self._prefix}/{path.name}" for path in self._source.iterdir())
+
+    def read_bytes(self, uri: str) -> bytes:
+        name = uri.rsplit("/", 1)[-1]
+        return (self._source / name).read_bytes()
 
     def download_file(self, source_uri: str, destination: Path) -> None:
         self.downloads += 1
@@ -176,3 +181,94 @@ def test_resolve_uses_a_local_directory_without_a_store(tmp_path):
 
     assert resolved.path == local
     assert resolved.package_uri is None
+
+
+class PointerStore:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def read_bytes(self, uri: str) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+    def list_uris(self, prefix_uri: str) -> list[str]:
+        raise AssertionError("not used")
+
+    def download_file(self, source_uri: str, destination: Path) -> None:
+        raise AssertionError("not used")
+
+
+def test_read_current_model_pointer_validates_the_approved_target():
+    pointer = read_current_model_pointer(
+        "gs://llm-router/models/router-modernbert/CURRENT.json",
+        object_store=PointerStore(
+            {
+                "schema_version": "router-current-model-v1",
+                "model_version": MODEL_VERSION,
+                "package_uri": PACKAGE_URI,
+                "manifest_sha256": "a" * 64,
+                "id2label": {"0": "easy", "1": "medium", "2": "hard"},
+                "logical_model_version": "2.1",
+                "training_mode": "minor_fine_tune",
+                "previous_model_version": "router-modernbert-base-20260814-45dcc6d",
+                "approved_at": "2026-09-12T09:07:00Z",
+            }
+        ),
+    )
+
+    assert pointer.model_version == MODEL_VERSION
+    assert pointer.package_uri == PACKAGE_URI
+    assert pointer.manifest_sha256 == "a" * 64
+    assert pointer.logical_model_version == "2.1"
+    assert pointer.training_mode == "minor_fine_tune"
+    assert pointer.previous_model_version == "router-modernbert-base-20260814-45dcc6d"
+    assert pointer.approved_at is not None
+
+
+def test_read_current_model_pointer_rejects_a_package_outside_its_root():
+    with pytest.raises(ModelSourceError, match="pointer-root"):
+        read_current_model_pointer(
+            "gs://llm-router/models/router-modernbert/CURRENT.json",
+            object_store=PointerStore(
+                {
+                    "schema_version": "router-current-model-v1",
+                    "model_version": MODEL_VERSION,
+                    "package_uri": "gs://other-bucket/models/router/approved",
+                    "manifest_sha256": "a" * 64,
+                    "id2label": {"0": "easy", "1": "medium", "2": "hard"},
+                }
+            ),
+        )
+
+
+def test_read_current_model_pointer_rejects_a_package_path_for_another_version():
+    with pytest.raises(ModelSourceError, match="pointer-root"):
+        read_current_model_pointer(
+            "gs://llm-router/models/router-modernbert/CURRENT.json",
+            object_store=PointerStore(
+                {
+                    "schema_version": "router-current-model-v1",
+                    "model_version": MODEL_VERSION,
+                    "package_uri": (
+                        "gs://llm-router/models/router-modernbert/router-other/approved"
+                    ),
+                    "manifest_sha256": "a" * 64,
+                    "id2label": {"0": "easy", "1": "medium", "2": "hard"},
+                }
+            ),
+        )
+
+
+def test_read_current_model_pointer_rejects_an_unsafe_version():
+    with pytest.raises(ModelSourceError, match="not a safe router version"):
+        read_current_model_pointer(
+            "gs://llm-router/models/router-modernbert/CURRENT.json",
+            object_store=PointerStore(
+                {
+                    "schema_version": "router-current-model-v1",
+                    "model_version": "../router-evil",
+                    "package_uri": PACKAGE_URI,
+                    "manifest_sha256": "a" * 64,
+                    "id2label": {"0": "easy", "1": "medium", "2": "hard"},
+                }
+            ),
+        )
