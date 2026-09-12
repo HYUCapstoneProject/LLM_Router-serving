@@ -1,0 +1,23 @@
+{
+  "schemaVersion": "router-model-status-v1",
+  "status": "inSync",
+  "source": "currentPointer",
+  "desired": {
+    "modelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+    "logicalModelVersion": "2.1",
+    "trainingMode": "minor_fine_tune",
+    "manifestSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "approvedAt": "2026-09-12T09:07:00Z"
+  },
+  "serving": {
+    "modelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+    "logicalModelVersion": "2.1",
+    "loadedAt": "2026-09-12T09:08:01Z"
+  },
+  "previousKnownGood": {
+    "modelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d"
+  },
+  "lastPointerCheckAt": "2026-09-12T09:08:01Z",
+  "lastSuccessfulSwapAt": "2026-09-12T09:08:01Z",
+  "lastLoadError": null
+}

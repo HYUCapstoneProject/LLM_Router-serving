@@ -1,0 +1,1942 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "LLM Router FastAPI",
+    "version": "1.0.0",
+    "description": "Spring backend와 FastAPI serving/retraining gateway 사이의 v1 연동 계약이다.\nSpring은 escalation event를 inline JSON으로 보내며 GCS, Parquet, manifest 또는\nVertex AI를 직접 다루지 않는다.\n"
+  },
+  "servers": [
+    {
+      "url": "https://{host}",
+      "description": "Environment-specific FastAPI server",
+      "variables": {
+        "host": {
+          "default": "llm-router.example.com"
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "name": "Routing"
+    },
+    {
+      "name": "Health"
+    },
+    {
+      "name": "Retraining"
+    },
+    {
+      "name": "Model"
+    },
+    {
+      "name": "Developer"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "operationId": "getHealth",
+        "summary": "Check embedding and router model readiness",
+        "responses": {
+          "200": {
+            "description": "Both models are ready",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "ok",
+                  "embedModel": "loaded",
+                  "routerModel": "loaded"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "At least one model is not ready",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "not_ready",
+                  "embedModel": "loaded",
+                  "routerModel": "loading"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/router/embed": {
+      "post": {
+        "tags": [
+          "Routing"
+        ],
+        "operationId": "embedMessage",
+        "summary": "Embed one question for the Spring cache lookup",
+        "security": [
+          {
+            "internalBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessageRequest"
+              },
+              "example": {
+                "message": "How does photosynthesis work?"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Normalized embedding",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmbedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/router/classify": {
+      "post": {
+        "tags": [
+          "Routing"
+        ],
+        "operationId": "classifyMessage",
+        "summary": "Classify one cache-miss question into a routing tier",
+        "security": [
+          {
+            "internalBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MessageRequest"
+              },
+              "example": {
+                "message": "How does photosynthesis work?"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Router classification",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClassifyResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/escalate": {
+      "post": {
+        "tags": [
+          "Retraining"
+        ],
+        "operationId": "submitEscalationBatch",
+        "summary": "Submit one or more inline escalation events for retraining",
+        "description": "FastAPI validates and canonicalizes the events, creates Parquet and manifest\nartifacts in GCS, builds the cycle/replay input, and submits a Vertex AI\nPipelineJob. HTTP 202 means submission succeeded; it does not mean training\nor serving activation succeeded.\n",
+        "security": [
+          {
+            "internalBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EscalateRequest"
+              },
+              "examples": {
+                "oneEvent": {
+                  "summary": "One valid event",
+                  "value": {
+                    "batchId": "feedback-20260912-0001",
+                    "schemaVersion": "feedback-inline-v1",
+                    "requestedAt": "2026-09-12T06:30:00Z",
+                    "events": [
+                      {
+                        "eventId": "esc-284391",
+                        "requestId": "req-019c1234",
+                        "question": "Explain why the sky appears blue.",
+                        "initialLabel": "easy",
+                        "initialModel": "haiku",
+                        "finalLabel": "medium",
+                        "finalModel": "sonnet",
+                        "userSatisfied": true,
+                        "escalationCount": 1,
+                        "createdAt": "2026-09-12T06:27:41Z",
+                        "routerModelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d",
+                        "piiRedacted": true
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "GCS materialization and Vertex PipelineJob submission accepted",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EscalateAcceptedResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "Batch identity, concurrency, or immutable GCS object conflict",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                },
+                "examples": {
+                  "batchConflict": {
+                    "value": {
+                      "error": "batchId already exists with different request content",
+                      "code": "BATCH_ID_CONFLICT",
+                      "requestId": "req-retrain-1"
+                    }
+                  },
+                  "inProgress": {
+                    "value": {
+                      "error": "another retraining pipeline is in progress",
+                      "code": "RETRAINING_IN_PROGRESS",
+                      "requestId": "req-retrain-1"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Inline feedback schema or business validation failed",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Vertex AI rejected pipeline submission",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/retraining-runs/{batchId}": {
+      "get": {
+        "tags": [
+          "Retraining"
+        ],
+        "operationId": "getRetrainingRun",
+        "summary": "Get pipeline, result, and model activation status",
+        "security": [
+          {
+            "internalBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          },
+          {
+            "name": "batchId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/BatchId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Latest retraining snapshot, including terminal failures",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetrainingStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No retraining run exists for the batch ID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/ServiceUnavailable"
+          }
+        }
+      }
+    },
+    "/router/model/current": {
+      "get": {
+        "tags": [
+          "Model"
+        ],
+        "operationId": "getCurrentRouterModel",
+        "summary": "Compare desired approved model with the model serving in memory",
+        "security": [
+          {
+            "internalBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current model and hot-swap state",
+            "headers": {
+              "X-Request-ID": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentModelResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "description": "No usable router model is serving",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CurrentModelResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/developer/retraining/version-policy": {
+      "get": {
+        "tags": [
+          "Developer"
+        ],
+        "operationId": "getRetrainingVersionPolicy",
+        "summary": "Read the developer-controlled version trigger policy",
+        "description": "Developer-only endpoint. Spring must not call it.",
+        "security": [
+          {
+            "developerBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current version policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionPolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Developer"
+        ],
+        "operationId": "updateRetrainingVersionPolicy",
+        "summary": "Schedule a version trigger policy change",
+        "description": "Developer-only endpoint. A policy change activates at the next major\nboundary, does not reset counters, and does not reinterpret submitted runs.\n",
+        "security": [
+          {
+            "developerBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/XRequestId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionPolicyUpdateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated policy and pending boundary change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionPolicyResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "description": "expectedRevision does not match",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "internalBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque internal token",
+        "description": "Spring-to-FastAPI credential"
+      },
+      "developerBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque developer token",
+        "description": "Separate developer credential; never issued to Spring"
+      }
+    },
+    "headers": {
+      "XRequestId": {
+        "description": "Request correlation ID",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "parameters": {
+      "XRequestId": {
+        "name": "X-Request-ID",
+        "in": "header",
+        "required": false,
+        "description": "Spring-generated request correlation ID",
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid routing message",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or invalid credential",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The authenticated identity lacks required permission",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "ValidationFailed": {
+        "description": "Request validation failed",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Inference or internal processing failed",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "Model, GCS, Vertex AI, or status backend is unavailable",
+        "headers": {
+          "X-Request-ID": {
+            "$ref": "#/components/headers/XRequestId"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "BatchId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 200,
+        "pattern": "^[A-Za-z0-9._-]+$",
+        "example": "feedback-20260912-0001"
+      },
+      "RouterTier": {
+        "type": "string",
+        "enum": [
+          "easy",
+          "medium",
+          "hard"
+        ]
+      },
+      "RoutedModel": {
+        "type": "string",
+        "enum": [
+          "haiku",
+          "sonnet",
+          "opus"
+        ]
+      },
+      "TrainingMode": {
+        "type": "string",
+        "enum": [
+          "minor_fine_tune",
+          "major_consolidation",
+          "pristine_rebase"
+        ]
+      },
+      "InitializationMode": {
+        "type": "string",
+        "enum": [
+          "approved_anchor",
+          "pristine_modernbert"
+        ]
+      },
+      "VersionPolicyMode": {
+        "type": "string",
+        "enum": [
+          "successfulHttpRequest",
+          "validatedUniqueBatch"
+        ]
+      },
+      "MessageRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Non-blank user question"
+          }
+        }
+      },
+      "EmbedResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "embedding",
+          "dim",
+          "modelVersion"
+        ],
+        "properties": {
+          "embedding": {
+            "type": "array",
+            "minItems": 1024,
+            "maxItems": 1024,
+            "items": {
+              "type": "number",
+              "format": "float"
+            }
+          },
+          "dim": {
+            "type": "integer",
+            "const": 1024
+          },
+          "modelVersion": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "ClassifyResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tier",
+          "model",
+          "confidence",
+          "modelVersion"
+        ],
+        "properties": {
+          "tier": {
+            "$ref": "#/components/schemas/RouterTier"
+          },
+          "model": {
+            "$ref": "#/components/schemas/RoutedModel"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "modelVersion": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "ModelLoadStatus": {
+        "type": "string",
+        "enum": [
+          "loaded",
+          "loading",
+          "error"
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "embedModel",
+          "routerModel"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ok",
+              "not_ready"
+            ]
+          },
+          "embedModel": {
+            "$ref": "#/components/schemas/ModelLoadStatus"
+          },
+          "routerModel": {
+            "$ref": "#/components/schemas/ModelLoadStatus"
+          }
+        }
+      },
+      "EscalationEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "eventId",
+          "requestId",
+          "question",
+          "initialLabel",
+          "initialModel",
+          "finalLabel",
+          "finalModel",
+          "userSatisfied",
+          "escalationCount",
+          "createdAt",
+          "routerModelVersion",
+          "piiRedacted"
+        ],
+        "properties": {
+          "eventId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "question": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100000,
+            "description": "Question after actual PII redaction"
+          },
+          "initialLabel": {
+            "$ref": "#/components/schemas/RouterTier"
+          },
+          "initialModel": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "finalLabel": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/RouterTier"
+              }
+            ],
+            "description": "Must be strictly higher than initialLabel"
+          },
+          "finalModel": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "userSatisfied": {
+            "type": "boolean",
+            "const": true
+          },
+          "escalationCount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$",
+            "description": "UTC timestamp"
+          },
+          "routerModelVersion": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "piiRedacted": {
+            "type": "boolean",
+            "const": true
+          }
+        },
+        "x-cross-field-rules": [
+          "finalLabel must be strictly higher than initialLabel"
+        ]
+      },
+      "EscalateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "batchId",
+          "schemaVersion",
+          "requestedAt",
+          "events"
+        ],
+        "properties": {
+          "batchId": {
+            "$ref": "#/components/schemas/BatchId"
+          },
+          "schemaVersion": {
+            "type": "string",
+            "const": "feedback-inline-v1"
+          },
+          "requestedAt": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "events": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/EscalationEvent"
+            },
+            "description": "eventId values must be unique within this array"
+          }
+        },
+        "x-idempotency": {
+          "key": "batchId",
+          "fingerprint": "batchId + schemaVersion + events sorted by eventId",
+          "excluded": [
+            "requestedAt",
+            "events array order"
+          ]
+        }
+      },
+      "EscalateAcceptedResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "status",
+          "batchId",
+          "pipelineRunId",
+          "logicalModelVersion",
+          "candidateModelVersion",
+          "trainingMode",
+          "versionPolicyMode",
+          "statusUrl"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string",
+            "const": "escalation-acceptance-v1"
+          },
+          "status": {
+            "type": "string",
+            "const": "accepted"
+          },
+          "batchId": {
+            "$ref": "#/components/schemas/BatchId"
+          },
+          "pipelineRunId": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Vertex resource name, not an HTTP URL"
+          },
+          "logicalModelVersion": {
+            "type": "string",
+            "pattern": "^[0-9]+[.][0-9]+$"
+          },
+          "candidateModelVersion": {
+            "type": "string",
+            "minLength": 1
+          },
+          "trainingMode": {
+            "$ref": "#/components/schemas/TrainingMode"
+          },
+          "versionPolicyMode": {
+            "$ref": "#/components/schemas/VersionPolicyMode"
+          },
+          "statusUrl": {
+            "type": "string",
+            "format": "uri-reference",
+            "pattern": "^/retraining-runs/[A-Za-z0-9._-]+$"
+          }
+        }
+      },
+      "RetrainingOverallStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "cancelling",
+          "paused",
+          "succeeded",
+          "rejected",
+          "failed",
+          "cancelled",
+          "unknown"
+        ]
+      },
+      "RetrainingStageName": {
+        "type": "string",
+        "enum": [
+          "initializing",
+          "feedbackPreparation",
+          "feedbackMerge",
+          "training",
+          "evaluation",
+          "packaging",
+          "gate",
+          "publishing",
+          "complete"
+        ]
+      },
+      "StageExecutionStatus": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "running",
+          "succeeded",
+          "failed",
+          "cancelled",
+          "skipped",
+          "unknown"
+        ]
+      },
+      "TrainingVersion": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "logicalModelVersion",
+          "candidateModelVersion",
+          "trainingMode",
+          "initializationMode",
+          "versionPolicyMode"
+        ],
+        "properties": {
+          "logicalModelVersion": {
+            "type": "string",
+            "pattern": "^[0-9]+[.][0-9]+$"
+          },
+          "candidateModelVersion": {
+            "type": "string",
+            "minLength": 1
+          },
+          "trainingMode": {
+            "$ref": "#/components/schemas/TrainingMode"
+          },
+          "initializationMode": {
+            "$ref": "#/components/schemas/InitializationMode"
+          },
+          "versionPolicyMode": {
+            "$ref": "#/components/schemas/VersionPolicyMode"
+          }
+        }
+      },
+      "StageProgress": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "current",
+          "total",
+          "unit",
+          "percent",
+          "epoch",
+          "totalEpochs",
+          "heartbeatAt"
+        ],
+        "properties": {
+          "current": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "unit": {
+            "type": "string",
+            "const": "optimizerStep"
+          },
+          "percent": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "epoch": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "totalEpochs": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "heartbeatAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "StageRecord": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "status",
+          "startedAt",
+          "endedAt"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "feedbackPreparation",
+              "feedbackMerge",
+              "training",
+              "evaluation",
+              "packaging",
+              "gate",
+              "publishing"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/StageExecutionStatus"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "endedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "CountMap": {
+        "type": "object",
+        "additionalProperties": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "FilteringMetrics": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "inputEventCount",
+          "acceptedEventCount",
+          "excludedEventCount",
+          "collapsedDuplicateEventCount",
+          "canonicalTrainingRowCount",
+          "exclusionDistribution",
+          "labelDistribution"
+        ],
+        "properties": {
+          "inputEventCount": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "acceptedEventCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "excludedEventCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "collapsedDuplicateEventCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "canonicalTrainingRowCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "exclusionDistribution": {
+            "$ref": "#/components/schemas/CountMap"
+          },
+          "labelDistribution": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "easy",
+              "medium",
+              "hard"
+            ],
+            "properties": {
+              "easy": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "medium": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "hard": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      },
+      "MergeMetrics": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "feedbackInputRowCount",
+          "acceptedFeedbackRowCount",
+          "excludedFeedbackRowCount",
+          "replacedBaseRowCount",
+          "mergedTrainingRowCount",
+          "decisionDistribution"
+        ],
+        "properties": {
+          "feedbackInputRowCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "acceptedFeedbackRowCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "excludedFeedbackRowCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "replacedBaseRowCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "mergedTrainingRowCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "decisionDistribution": {
+            "$ref": "#/components/schemas/CountMap"
+          }
+        }
+      },
+      "RetrainingOutcome": {
+        "type": "string",
+        "enum": [
+          "promoted",
+          "rejected",
+          "failed",
+          "cancelled"
+        ]
+      },
+      "FailureCode": {
+        "type": "string",
+        "enum": [
+          "FEEDBACK_VALIDATION_FAILED",
+          "NO_UNIQUE_FEEDBACK",
+          "TRAINING_FAILED",
+          "EVALUATION_FAILED",
+          "DEPLOY_GATE_REJECTED",
+          "PACKAGE_FAILED",
+          "PUBLISH_FAILED",
+          "PIPELINE_CANCELLED",
+          "UNKNOWN_PIPELINE_FAILURE"
+        ]
+      },
+      "RetrainingResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "outcome",
+          "candidateModelVersion",
+          "logicalModelVersion",
+          "gatePassed",
+          "failedGateChecks",
+          "failureCode",
+          "failureStage",
+          "retryable",
+          "message",
+          "approvedAt"
+        ],
+        "properties": {
+          "outcome": {
+            "$ref": "#/components/schemas/RetrainingOutcome"
+          },
+          "candidateModelVersion": {
+            "type": "string"
+          },
+          "logicalModelVersion": {
+            "type": "string"
+          },
+          "gatePassed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failedGateChecks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "failureCode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FailureCode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "failureStage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetrainingStageName"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "approvedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ActivationStatusValue": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "active",
+          "loadFailed",
+          "superseded",
+          "notApplicable"
+        ]
+      },
+      "ActivationStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "status",
+          "desiredModelVersion",
+          "servingModelVersion",
+          "checkedAt"
+        ],
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/ActivationStatusValue"
+          },
+          "desiredModelVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "servingModelVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checkedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "RetrainingStatusResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "batchId",
+          "pipelineRunId",
+          "status",
+          "terminal",
+          "stage",
+          "version",
+          "stageProgress",
+          "stages",
+          "filtering",
+          "merge",
+          "result",
+          "activation",
+          "submittedAt",
+          "startedAt",
+          "endedAt",
+          "lastUpdatedAt",
+          "stale",
+          "warnings"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string",
+            "const": "retraining-status-v1"
+          },
+          "batchId": {
+            "$ref": "#/components/schemas/BatchId"
+          },
+          "pipelineRunId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "$ref": "#/components/schemas/RetrainingOverallStatus"
+          },
+          "terminal": {
+            "type": "boolean"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/RetrainingStageName"
+          },
+          "version": {
+            "$ref": "#/components/schemas/TrainingVersion"
+          },
+          "stageProgress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StageProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stages": {
+            "type": "array",
+            "minItems": 7,
+            "maxItems": 7,
+            "items": {
+              "$ref": "#/components/schemas/StageRecord"
+            }
+          },
+          "filtering": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FilteringMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "merge": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MergeMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetrainingResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "activation": {
+            "$ref": "#/components/schemas/ActivationStatus"
+          },
+          "submittedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "endedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastUpdatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "ModelSource": {
+        "type": "string",
+        "enum": [
+          "currentPointer",
+          "fixedPackage",
+          "localPath"
+        ]
+      },
+      "DesiredModel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "modelVersion",
+          "logicalModelVersion",
+          "trainingMode",
+          "manifestSha256",
+          "approvedAt"
+        ],
+        "properties": {
+          "modelVersion": {
+            "type": "string"
+          },
+          "logicalModelVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trainingMode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TrainingMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "manifestSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "approvedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "ServingModel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "modelVersion",
+          "logicalModelVersion",
+          "loadedAt"
+        ],
+        "properties": {
+          "modelVersion": {
+            "type": "string"
+          },
+          "logicalModelVersion": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "loadedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "PreviousKnownGood": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "modelVersion"
+        ],
+        "properties": {
+          "modelVersion": {
+            "type": "string"
+          }
+        }
+      },
+      "CurrentModelResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "status",
+          "source",
+          "desired",
+          "serving",
+          "previousKnownGood",
+          "lastPointerCheckAt",
+          "lastSuccessfulSwapAt",
+          "lastLoadError"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string",
+            "const": "router-model-status-v1"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "inSync",
+              "loading",
+              "loadFailed",
+              "static",
+              "unavailable"
+            ]
+          },
+          "source": {
+            "$ref": "#/components/schemas/ModelSource"
+          },
+          "desired": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DesiredModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serving": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ServingModel"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "previousKnownGood": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PreviousKnownGood"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastPointerCheckAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastSuccessfulSwapAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lastLoadError": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "PendingPolicyChange": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mode",
+          "activation",
+          "requestedAt",
+          "requestedBy",
+          "reason"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/VersionPolicyMode"
+          },
+          "activation": {
+            "type": "string",
+            "const": "nextMajorBoundary"
+          },
+          "requestedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "requestedBy": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "VersionPolicyResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "schemaVersion",
+          "mode",
+          "callsPerMajor",
+          "rebaseEveryMajorCycles",
+          "committedSuccessfulRuns",
+          "cyclePosition",
+          "currentLogicalModelVersion",
+          "nextLogicalModelVersion",
+          "revision",
+          "pendingChange",
+          "updatedAt",
+          "updatedBy"
+        ],
+        "properties": {
+          "schemaVersion": {
+            "type": "string",
+            "const": "retraining-version-policy-v1"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/VersionPolicyMode"
+          },
+          "callsPerMajor": {
+            "type": "integer",
+            "const": 3
+          },
+          "rebaseEveryMajorCycles": {
+            "type": "integer",
+            "const": 5
+          },
+          "committedSuccessfulRuns": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cyclePosition": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2
+          },
+          "currentLogicalModelVersion": {
+            "type": "string"
+          },
+          "nextLogicalModelVersion": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "pendingChange": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingPolicyChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedBy": {
+            "type": "string"
+          }
+        }
+      },
+      "VersionPolicyUpdateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mode",
+          "activation",
+          "expectedRevision",
+          "reason"
+        ],
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/VersionPolicyMode"
+          },
+          "activation": {
+            "type": "string",
+            "const": "nextMajorBoundary"
+          },
+          "expectedRevision": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          }
+        }
+      },
+      "ApiErrorCode": {
+        "type": "string",
+        "enum": [
+          "INVALID_MESSAGE",
+          "UNAUTHORIZED",
+          "FORBIDDEN",
+          "REQUEST_VALIDATION_FAILED",
+          "UNSUPPORTED_SCHEMA_VERSION",
+          "BATCH_ID_CONFLICT",
+          "RETRAINING_IN_PROGRESS",
+          "GCS_OBJECT_CONFLICT",
+          "GCS_BACKEND_UNAVAILABLE",
+          "PIPELINE_SUBMISSION_FAILED",
+          "PIPELINE_BACKEND_UNAVAILABLE",
+          "PIPELINE_STATUS_UNAVAILABLE",
+          "RETRAINING_RUN_NOT_FOUND",
+          "EMBED_MODEL_NOT_READY",
+          "ROUTER_MODEL_NOT_READY",
+          "EMBEDDING_INFERENCE_FAILED",
+          "ROUTER_INFERENCE_FAILED",
+          "REVISION_CONFLICT",
+          "INTERNAL_SERVER_ERROR"
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error",
+          "code",
+          "requestId"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "code": {
+            "$ref": "#/components/schemas/ApiErrorCode"
+          },
+          "requestId": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

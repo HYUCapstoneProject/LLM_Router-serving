@@ -1,0 +1,11 @@
+{
+  "schemaVersion": "escalation-acceptance-v1",
+  "status": "accepted",
+  "batchId": "feedback-20260912-0001",
+  "pipelineRunId": "projects/123456789/locations/us-west1/pipelineJobs/retrain-feedback-20260912-0001-a1b2c3",
+  "logicalModelVersion": "2.1",
+  "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+  "trainingMode": "minor_fine_tune",
+  "versionPolicyMode": "successfulHttpRequest",
+  "statusUrl": "/retraining-runs/feedback-20260912-0001"
+}

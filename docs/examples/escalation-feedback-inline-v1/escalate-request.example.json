@@ -1,0 +1,21 @@
+{
+  "batchId": "feedback-20260912-0001",
+  "schemaVersion": "feedback-inline-v1",
+  "requestedAt": "2026-09-12T06:30:00Z",
+  "events": [
+    {
+      "eventId": "esc-284391",
+      "requestId": "req-019c1234",
+      "question": "Explain why the sky appears blue.",
+      "initialLabel": "easy",
+      "initialModel": "haiku",
+      "finalLabel": "medium",
+      "finalModel": "sonnet",
+      "userSatisfied": true,
+      "escalationCount": 1,
+      "createdAt": "2026-09-12T06:27:41Z",
+      "routerModelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d",
+      "piiRedacted": true
+    }
+  ]
+}

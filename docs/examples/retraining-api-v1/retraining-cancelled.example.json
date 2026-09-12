@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "retraining-status-v1",
+  "batchId": "feedback-20260912-0003",
+  "pipelineRunId": "projects/123456789/locations/us-west1/pipelineJobs/retrain-feedback-20260912-0003-c3d4e5",
+  "status": "cancelled",
+  "terminal": true,
+  "stage": "complete",
+  "version": {
+    "logicalModelVersion": "2.1",
+    "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-c3d4e5f6-45dcc6d",
+    "trainingMode": "minor_fine_tune",
+    "initializationMode": "approved_anchor",
+    "versionPolicyMode": "successfulHttpRequest"
+  },
+  "stageProgress": null,
+  "stages": [
+    {"name": "feedbackPreparation", "status": "succeeded", "startedAt": "2026-09-12T13:01:04Z", "endedAt": "2026-09-12T13:02:11Z"},
+    {"name": "feedbackMerge", "status": "succeeded", "startedAt": "2026-09-12T13:02:13Z", "endedAt": "2026-09-12T13:03:02Z"},
+    {"name": "training", "status": "cancelled", "startedAt": "2026-09-12T13:04:20Z", "endedAt": "2026-09-12T13:10:00Z"},
+    {"name": "evaluation", "status": "skipped", "startedAt": null, "endedAt": null},
+    {"name": "packaging", "status": "skipped", "startedAt": null, "endedAt": null},
+    {"name": "gate", "status": "skipped", "startedAt": null, "endedAt": null},
+    {"name": "publishing", "status": "skipped", "startedAt": null, "endedAt": null}
+  ],
+  "filtering": null,
+  "merge": null,
+  "result": {
+    "outcome": "cancelled",
+    "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-c3d4e5f6-45dcc6d",
+    "logicalModelVersion": "2.1",
+    "gatePassed": null,
+    "failedGateChecks": [],
+    "failureCode": "PIPELINE_CANCELLED",
+    "failureStage": "training",
+    "retryable": false,
+    "message": "Pipeline was cancelled",
+    "approvedAt": null
+  },
+  "activation": {
+    "status": "notApplicable",
+    "desiredModelVersion": null,
+    "servingModelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d",
+    "checkedAt": "2026-09-12T13:10:01Z"
+  },
+  "submittedAt": "2026-09-12T13:00:02Z",
+  "startedAt": "2026-09-12T13:00:45Z",
+  "endedAt": "2026-09-12T13:10:00Z",
+  "lastUpdatedAt": "2026-09-12T13:10:01Z",
+  "stale": false,
+  "warnings": []
+}

@@ -6,6 +6,23 @@ from llm_router_serving.main import create_app
 from llm_router_serving.model_manager import ModelManager
 
 
+def escalation_event(event_id: str = "esc-1") -> dict[str, object]:
+    return {
+        "eventId": event_id,
+        "requestId": f"req-{event_id}",
+        "question": "Explain why the sky appears blue.",
+        "initialLabel": "easy",
+        "initialModel": "haiku",
+        "finalLabel": "medium",
+        "finalModel": "sonnet",
+        "userSatisfied": True,
+        "escalationCount": 1,
+        "createdAt": "2026-08-12T15:00:00Z",
+        "routerModelVersion": "router-modernbert-base-routerbench-20260731-21c2f1b",
+        "piiRedacted": True,
+    }
+
+
 def test_embed_returns_contract_vector(client, auth_headers):
     response = client.post(
         "/router/embed",
@@ -98,44 +115,74 @@ def test_health_returns_503_while_models_are_loading(settings, escalation_servic
     }
 
 
+def test_current_model_reports_the_model_actually_serving(client, auth_headers):
+    response = client.get("/router/model/current", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["schemaVersion"] == "router-model-status-v1"
+    assert payload["status"] == "static"
+    assert payload["source"] in {"fixedPackage", "localPath"}
+    assert payload["desired"] is None
+    assert payload["serving"]["modelVersion"].startswith("router-modernbert")
+    assert payload["lastLoadError"] is None
+
+
 def test_escalate_returns_202_and_pipeline_run_id(client, auth_headers, escalation_service):
     response = client.post(
         "/escalate",
         headers=auth_headers,
         json={
             "batchId": "feedback-20260812-0001",
-            "schemaVersion": "feedback-export-v0.1",
-            "manifestUri": (
-                "gs://llm-router/datasets/feedback/feedback-20260812-0001/manifest.json"
-            ),
-            "eventsUri": (
-                "gs://llm-router/datasets/feedback/feedback-20260812-0001/events.parquet"
-            ),
-            "eventCount": 1000,
+            "schemaVersion": "feedback-inline-v1",
             "requestedAt": "2026-08-12T15:30:00Z",
+            "events": [escalation_event("esc-1"), escalation_event("esc-2")],
         },
     )
 
     assert response.status_code == 202
     assert response.json() == {
+        "schemaVersion": "escalation-acceptance-v1",
         "status": "accepted",
         "batchId": "feedback-20260812-0001",
         "pipelineRunId": "pipeline-run-123",
+        "logicalModelVersion": "1.1",
+        "candidateModelVersion": (
+            "router-modernbert-feedback-v1.1-20260812-a1b2c3d4-21c2f1b"
+        ),
+        "trainingMode": "minor_fine_tune",
+        "versionPolicyMode": "successfulHttpRequest",
+        "statusUrl": "/retraining-runs/feedback-20260812-0001",
     }
     assert escalation_service.calls == 1
 
 
-def test_escalate_rejects_non_contract_event_count(client, auth_headers):
+def test_escalate_accepts_a_single_event_batch(client, auth_headers, escalation_service):
     response = client.post(
         "/escalate",
         headers=auth_headers,
         json={
             "batchId": "feedback-20260812-0001",
-            "schemaVersion": "feedback-export-v0.1",
-            "manifestUri": "gs://llm-router/manifest.json",
-            "eventsUri": "gs://llm-router/events.parquet",
-            "eventCount": 999,
+            "schemaVersion": "feedback-inline-v1",
             "requestedAt": "2026-08-12T15:30:00Z",
+            "events": [escalation_event()],
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["pipelineRunId"] == "pipeline-run-123"
+    assert escalation_service.calls == 1
+
+
+def test_escalate_rejects_an_empty_event_batch(client, auth_headers):
+    response = client.post(
+        "/escalate",
+        headers=auth_headers,
+        json={
+            "batchId": "feedback-20260812-0001",
+            "schemaVersion": "feedback-inline-v1",
+            "requestedAt": "2026-08-12T15:30:00Z",
+            "events": [],
         },
     )
 

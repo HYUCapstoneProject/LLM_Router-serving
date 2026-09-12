@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager, suppress
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Request, Response, status
+from fastapi import Depends, FastAPI, Request, Response, Security, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from llm_router_serving.config import Settings
 from llm_router_serving.errors import ApiError, ModelContractError
@@ -17,32 +18,45 @@ from llm_router_serving.inference import (
     ClassificationEngine,
     EmbeddingEngine,
     RerankEngine,
-    TransformersCrossEncoderReranker,
     TransformersBgeEmbedder,
+    TransformersCrossEncoderReranker,
     TransformersModernBertClassifier,
 )
 from llm_router_serving.model_manager import ModelManager
-from llm_router_serving.model_source import ModelSourceError, resolve_router_model
+from llm_router_serving.model_source import (
+    CurrentModelPointer,
+    GcsPackageStore,
+    ModelSourceError,
+    read_current_model_pointer,
+    resolve_router_model,
+)
+from llm_router_serving.model_updates import ModelPointerWatcher, ModelPointerWatcherSnapshot
 from llm_router_serving.retraining.gcs import (
     BatchValidationError,
     FeedbackBatchValidator,
+    FeedbackReplayMaterializer,
     GcsObjectStore,
     ObjectAccessError,
 )
+from llm_router_serving.retraining.observability import RetrainingObservabilityReader
 from llm_router_serving.retraining.pipeline import (
     PipelineAuthorizationError,
     PipelineBackendUnavailable,
     PipelineSubmissionError,
     VertexPipelineClient,
 )
-from llm_router_serving.retraining.service import EscalationService
+from llm_router_serving.retraining.service import EscalationService, RetrainingRunNotFoundError
 from llm_router_serving.retraining.store import (
     BatchIdConflictError,
     RetrainingInProgressError,
     RetrainingJobStore,
+    VersionPolicyRevisionConflictError,
 )
 from llm_router_serving.schemas import (
     ClassifyResponse,
+    CurrentModelResponse,
+    CurrentModelStatus,
+    DesiredModel,
     EmbedResponse,
     ErrorResponse,
     EscalateRequest,
@@ -51,27 +65,60 @@ from llm_router_serving.schemas import (
     HealthStatus,
     MessageRequest,
     ModelLoadStatus,
+    ModelSource,
+    PreviousKnownGood,
     RerankRequest,
     RerankResponse,
+    RetrainingStatusResponse,
+    ServingModel,
+    TrainingMode,
+    VersionPolicyResponse,
+    VersionPolicyUpdateRequest,
 )
 
 logger = logging.getLogger(__name__)
 
+internal_bearer = HTTPBearer(auto_error=False, scheme_name="internalBearer")
+developer_bearer = HTTPBearer(auto_error=False, scheme_name="developerBearer")
 
-async def require_internal_auth(request: Request) -> None:
+
+async def require_internal_auth(
+    request: Request,
+    credential: Annotated[
+        HTTPAuthorizationCredentials | None, Security(internal_bearer)
+    ],
+) -> None:
     settings: Settings = request.app.state.settings
     expected_secret = settings.internal_api_token
     if expected_secret is None:
         return
-    authorization = request.headers.get("Authorization", "")
-    scheme, _, supplied = authorization.partition(" ")
-    if scheme.lower() != "bearer" or not supplied:
+    if credential is None or credential.scheme.lower() != "bearer":
         raise ApiError(status.HTTP_401_UNAUTHORIZED, "UNAUTHORIZED", "authentication required")
-    if not hmac.compare_digest(supplied, expected_secret.get_secret_value()):
+    if not hmac.compare_digest(credential.credentials, expected_secret.get_secret_value()):
         raise ApiError(status.HTTP_401_UNAUTHORIZED, "UNAUTHORIZED", "invalid credential")
 
 
 InternalAuth = Annotated[None, Depends(require_internal_auth)]
+
+
+async def require_developer_auth(
+    request: Request,
+    credential: Annotated[
+        HTTPAuthorizationCredentials | None, Security(developer_bearer)
+    ],
+) -> None:
+    settings: Settings = request.app.state.settings
+    if not settings.enable_developer_api or settings.developer_api_token is None:
+        raise ApiError(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "developer API is disabled")
+    if credential is None or credential.scheme.lower() != "bearer":
+        raise ApiError(status.HTTP_401_UNAUTHORIZED, "UNAUTHORIZED", "authentication required")
+    if not hmac.compare_digest(
+        credential.credentials, settings.developer_api_token.get_secret_value()
+    ):
+        raise ApiError(status.HTTP_401_UNAUTHORIZED, "UNAUTHORIZED", "invalid credential")
+
+
+DeveloperAuth = Annotated[None, Depends(require_developer_auth)]
 
 
 def _error_response(request: Request, *, status_code: int, code: str, message: str) -> JSONResponse:
@@ -81,6 +128,8 @@ def _error_response(request: Request, *, status_code: int, code: str, message: s
 
 
 def _build_model_manager(settings: Settings) -> ModelManager:
+    package_store = GcsPackageStore(project=settings.vertex_project)
+
     def load_embed() -> EmbeddingEngine:
         return TransformersBgeEmbedder.load(
             model_id=settings.embed_model_id,
@@ -92,22 +141,59 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             local_files_only=settings.embed_local_files_only,
         )
 
+    def load_router_version(
+        package_uri: str,
+        model_version: str,
+        manifest_sha256: str = "",
+    ) -> ClassificationEngine:
+        try:
+            resolved = resolve_router_model(
+                package_uri=package_uri,
+                local_path=None,
+                model_version=model_version,
+                cache_dir=settings.router_model_cache_dir,
+                object_store=package_store,
+                require_approved=settings.router_model_require_approved,
+                expected_manifest_sha256=manifest_sha256 or None,
+            )
+        except ModelSourceError as exc:
+            raise ModelContractError(str(exc)) from exc
+        return TransformersModernBertClassifier.load(
+            model_path=resolved.path,
+            model_version=resolved.model_version,
+            max_length=settings.router_max_length,
+            device_name=settings.model_device,
+        )
+
     def load_router() -> ClassificationEngine:
         source_errors = settings.router_model_source_errors()
         if source_errors:
             raise ModelContractError(
                 "Router model source is not configured: " + "; ".join(source_errors)
             )
-        try:
-            resolved = resolve_router_model(
-                package_uri=settings.router_model_package_uri,
-                local_path=settings.router_model_path,
-                model_version=str(settings.router_model_version),
-                cache_dir=settings.router_model_cache_dir,
-                require_approved=settings.router_model_require_approved,
+        pointer_uri = settings.current_model_pointer_uri()
+        if pointer_uri:
+            pointer = read_current_model_pointer(
+                pointer_uri,
+                object_store=package_store,
             )
-        except ModelSourceError as exc:
-            raise ModelContractError(str(exc)) from exc
+            return load_router_version(
+                pointer.package_uri,
+                pointer.model_version,
+                pointer.manifest_sha256,
+            )
+        if settings.router_model_path is None:
+            return load_router_version(
+                str(settings.router_model_package_uri),
+                str(settings.router_model_version),
+            )
+        resolved = resolve_router_model(
+            package_uri=None,
+            local_path=settings.router_model_path,
+            model_version=str(settings.router_model_version),
+            cache_dir=settings.router_model_cache_dir,
+            require_approved=settings.router_model_require_approved,
+        )
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
@@ -127,7 +213,25 @@ def _build_model_manager(settings: Settings) -> ModelManager:
     return ModelManager(
         embed_loader=load_embed,
         router_loader=load_router,
+        router_version_loader=load_router_version,
         rerank_loader=load_rerank if settings.rerank_model_id else None,
+    )
+
+
+def _build_model_pointer_watcher(
+    settings: Settings, model_manager: ModelManager
+) -> ModelPointerWatcher | None:
+    pointer_uri = settings.current_model_pointer_uri()
+    if not settings.router_model_auto_reload or not pointer_uri:
+        return None
+    pointer_store = GcsPackageStore(project=settings.vertex_project)
+    return ModelPointerWatcher(
+        model_manager=model_manager,
+        pointer_loader=lambda: read_current_model_pointer(
+            pointer_uri,
+            object_store=pointer_store,
+        ),
+        poll_interval_seconds=settings.router_model_poll_interval_seconds,
     )
 
 
@@ -143,16 +247,105 @@ def _build_escalation_service(settings: Settings) -> EscalationService | None:
         network=settings.vertex_pipeline_network,
         labels={"component": "feedback-retraining"},
     )
+    object_store = GcsObjectStore(project=settings.vertex_project)
     validator = FeedbackBatchValidator(
-        object_store=GcsObjectStore(),
-        allowed_buckets=settings.allowed_gcs_buckets,
         supported_schemas=settings.supported_feedback_schemas,
     )
+    derived_root = settings.derived_retraining_data_root_uri()
+    assert derived_root is not None
     return EscalationService(
         settings=settings,
         validator=validator,
         job_store=RetrainingJobStore(settings.retraining_db_path),
         pipeline_client=pipeline_client,
+        materializer=FeedbackReplayMaterializer(
+            object_store=object_store,
+            root_uri=derived_root,
+            rows_per_label=settings.retraining_replay_rows_per_label,
+        ),
+        observability_reader=(
+            RetrainingObservabilityReader(
+                object_store=object_store,
+                root_uri=str(settings.retraining_observability_root_uri),
+            )
+            if settings.retraining_observability_root_uri
+            else None
+        ),
+    )
+
+
+def _current_model_response(
+    settings: Settings,
+    model_manager: ModelManager,
+    watcher: ModelPointerWatcher | None,
+) -> CurrentModelResponse:
+    manager = model_manager.snapshot()
+    watcher_state = (
+        watcher.snapshot()
+        if watcher is not None
+        else ModelPointerWatcherSnapshot(None, False, None, None, None)
+    )
+    pointer: CurrentModelPointer | None = watcher_state.desired
+    serving_version = manager.router_model_version
+    if settings.router_model_path is not None:
+        source = ModelSource.LOCAL_PATH
+    elif settings.current_model_pointer_uri():
+        source = ModelSource.CURRENT_POINTER
+    else:
+        source = ModelSource.FIXED_PACKAGE
+
+    if serving_version is None:
+        current_status = CurrentModelStatus.UNAVAILABLE
+    elif watcher is None:
+        current_status = CurrentModelStatus.STATIC
+    elif watcher_state.last_load_error and (
+        pointer is None or pointer.model_version != serving_version
+    ):
+        current_status = CurrentModelStatus.LOAD_FAILED
+    elif watcher_state.loading or (pointer and pointer.model_version != serving_version):
+        current_status = CurrentModelStatus.LOADING
+    else:
+        current_status = CurrentModelStatus.IN_SYNC
+
+    desired = None
+    if pointer is not None:
+        desired = DesiredModel(
+            modelVersion=pointer.model_version,
+            logicalModelVersion=pointer.logical_model_version,
+            trainingMode=(TrainingMode(pointer.training_mode) if pointer.training_mode else None),
+            manifestSha256=pointer.manifest_sha256,
+            approvedAt=pointer.approved_at,
+        )
+    serving = None
+    if serving_version is not None:
+        logical_version = (
+            pointer.logical_model_version
+            if pointer is not None and pointer.model_version == serving_version
+            else None
+        )
+        serving = ServingModel(
+            modelVersion=serving_version,
+            logicalModelVersion=logical_version,
+            loadedAt=manager.router_loaded_at or watcher_state.last_pointer_check_at,
+        )
+    previous_version = manager.previous_router_model_version or (
+        pointer.previous_model_version if pointer is not None else None
+    )
+    return CurrentModelResponse(
+        status=current_status,
+        source=source,
+        desired=desired,
+        serving=serving,
+        previousKnownGood=(
+            PreviousKnownGood(modelVersion=previous_version) if previous_version else None
+        ),
+        lastPointerCheckAt=watcher_state.last_pointer_check_at,
+        lastSuccessfulSwapAt=watcher_state.last_successful_swap_at,
+        lastLoadError=(
+            "router model load failed"
+            if watcher_state.last_load_error or manager.router_error
+            else None
+        ),
     )
 
 
@@ -161,31 +354,44 @@ def create_app(
     settings: Settings | None = None,
     model_manager: ModelManager | None = None,
     escalation_service: EscalationService | None = None,
+    model_pointer_watcher: ModelPointerWatcher | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
     model_manager = model_manager or _build_model_manager(settings)
     if escalation_service is None:
         escalation_service = _build_escalation_service(settings)
+    if model_pointer_watcher is None:
+        model_pointer_watcher = _build_model_pointer_watcher(settings, model_manager)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         load_task: asyncio.Task[None] | None = None
+        watcher_task: asyncio.Task[None] | None = None
         if settings.load_models_on_startup:
             load_task = asyncio.create_task(model_manager.load_all())
+            if model_pointer_watcher is not None:
+
+                async def watch_after_initial_load() -> None:
+                    await load_task
+                    await model_pointer_watcher.run()
+
+                watcher_task = asyncio.create_task(watch_after_initial_load())
         yield
-        if load_task and not load_task.done():
-            load_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await load_task
+        for task in (watcher_task, load_task):
+            if task and not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     app = FastAPI(
         title=settings.app_name,
-        version="0.1.0",
+        version="1.0.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
     app.state.model_manager = model_manager
     app.state.escalation_service = escalation_service
+    app.state.model_pointer_watcher = model_pointer_watcher
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
@@ -439,7 +645,121 @@ def create_app(
         return EscalateResponse(
             batchId=accepted.batch_id,
             pipelineRunId=accepted.pipeline_run_id,
+            logicalModelVersion=accepted.logical_model_version,
+            candidateModelVersion=accepted.candidate_model_version,
+            trainingMode=accepted.training_mode,
+            versionPolicyMode=accepted.version_policy_mode,
+            statusUrl=f"/retraining-runs/{accepted.batch_id}",
         )
+
+    @app.get(
+        "/retraining-runs/{batchId}",
+        response_model=RetrainingStatusResponse,
+        responses={
+            401: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    async def retraining_status(
+        batchId: str, _: InternalAuth
+    ) -> RetrainingStatusResponse:
+        service = app.state.escalation_service
+        if service is None:
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "PIPELINE_STATUS_UNAVAILABLE",
+                "retraining status backend is not configured",
+            )
+        watcher = app.state.model_pointer_watcher
+        watcher_state = watcher.snapshot() if watcher is not None else None
+        try:
+            return await service.status(
+                batchId,
+                serving_model_version=model_manager.router_model_version(),
+                desired_model_version=(
+                    watcher_state.desired.model_version
+                    if watcher_state is not None and watcher_state.desired is not None
+                    else None
+                ),
+                desired_load_error=(
+                    watcher_state.last_load_error if watcher_state is not None else None
+                ),
+            )
+        except RetrainingRunNotFoundError as exc:
+            raise ApiError(
+                status.HTTP_404_NOT_FOUND,
+                "RETRAINING_RUN_NOT_FOUND",
+                "no retraining run exists for batchId",
+            ) from exc
+
+    @app.get(
+        "/router/model/current",
+        response_model=CurrentModelResponse,
+        responses={401: {"model": ErrorResponse}, 503: {"model": CurrentModelResponse}},
+    )
+    async def current_router_model(
+        response: Response, _: InternalAuth
+    ) -> CurrentModelResponse:
+        result = _current_model_response(
+            settings,
+            model_manager,
+            app.state.model_pointer_watcher,
+        )
+        if result.status is CurrentModelStatus.UNAVAILABLE:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return result
+
+    @app.get(
+        "/developer/retraining/version-policy",
+        response_model=VersionPolicyResponse,
+        responses={401: {"model": ErrorResponse}, 403: {"model": ErrorResponse}},
+    )
+    async def get_version_policy(_: DeveloperAuth) -> VersionPolicyResponse:
+        service = app.state.escalation_service
+        if service is None:
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "PIPELINE_STATUS_UNAVAILABLE",
+                "retraining backend is not configured",
+            )
+        return await asyncio.to_thread(service.version_policy)
+
+    @app.put(
+        "/developer/retraining/version-policy",
+        response_model=VersionPolicyResponse,
+        responses={
+            401: {"model": ErrorResponse},
+            403: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            422: {"model": ErrorResponse},
+        },
+    )
+    async def put_version_policy(
+        payload: VersionPolicyUpdateRequest,
+        _: DeveloperAuth,
+    ) -> VersionPolicyResponse:
+        service = app.state.escalation_service
+        if service is None:
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "PIPELINE_STATUS_UNAVAILABLE",
+                "retraining backend is not configured",
+            )
+        try:
+            return await asyncio.to_thread(
+                service.schedule_version_policy,
+                expected_revision=payload.expectedRevision,
+                mode=payload.mode.value,
+                actor="developer-api",
+                reason=payload.reason,
+            )
+        except VersionPolicyRevisionConflictError as exc:
+            raise ApiError(
+                status.HTTP_409_CONFLICT,
+                "REVISION_CONFLICT",
+                "expectedRevision does not match current policy revision",
+            ) from exc
 
     return app
 

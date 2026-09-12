@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "retraining-version-policy-v1",
+  "mode": "successfulHttpRequest",
+  "callsPerMajor": 3,
+  "rebaseEveryMajorCycles": 5,
+  "committedSuccessfulRuns": 4,
+  "cyclePosition": 1,
+  "currentLogicalModelVersion": "2.1",
+  "nextLogicalModelVersion": "2.2",
+  "revision": 4,
+  "pendingChange": null,
+  "updatedAt": "2026-09-12T10:00:00Z",
+  "updatedBy": "ml-dev@example.com"
+}

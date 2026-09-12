@@ -1,0 +1,6 @@
+{
+  "mode": "validatedUniqueBatch",
+  "activation": "nextMajorBoundary",
+  "expectedRevision": 4,
+  "reason": "production-like unique batch trigger test"
+}

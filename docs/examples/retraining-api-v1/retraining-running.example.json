@@ -1,0 +1,63 @@
+{
+  "schemaVersion": "retraining-status-v1",
+  "batchId": "feedback-20260912-0001",
+  "pipelineRunId": "projects/123456789/locations/us-west1/pipelineJobs/retrain-feedback-20260912-0001-a1b2c3",
+  "status": "running",
+  "terminal": false,
+  "stage": "training",
+  "version": {
+    "logicalModelVersion": "2.1",
+    "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+    "trainingMode": "minor_fine_tune",
+    "initializationMode": "approved_anchor",
+    "versionPolicyMode": "successfulHttpRequest"
+  },
+  "stageProgress": {
+    "current": 612,
+    "total": 7038,
+    "unit": "optimizerStep",
+    "percent": 8.7,
+    "epoch": 1,
+    "totalEpochs": 3,
+    "heartbeatAt": "2026-09-12T07:12:30Z"
+  },
+  "stages": [
+    {"name": "feedbackPreparation", "status": "succeeded", "startedAt": "2026-09-12T06:31:04Z", "endedAt": "2026-09-12T06:32:11Z"},
+    {"name": "feedbackMerge", "status": "succeeded", "startedAt": "2026-09-12T06:32:13Z", "endedAt": "2026-09-12T06:33:02Z"},
+    {"name": "training", "status": "running", "startedAt": "2026-09-12T06:34:20Z", "endedAt": null},
+    {"name": "evaluation", "status": "pending", "startedAt": null, "endedAt": null},
+    {"name": "packaging", "status": "pending", "startedAt": null, "endedAt": null},
+    {"name": "gate", "status": "pending", "startedAt": null, "endedAt": null},
+    {"name": "publishing", "status": "pending", "startedAt": null, "endedAt": null}
+  ],
+  "filtering": {
+    "inputEventCount": 3,
+    "acceptedEventCount": 3,
+    "excludedEventCount": 0,
+    "collapsedDuplicateEventCount": 0,
+    "canonicalTrainingRowCount": 3,
+    "exclusionDistribution": {},
+    "labelDistribution": {"easy": 0, "medium": 2, "hard": 1}
+  },
+  "merge": {
+    "feedbackInputRowCount": 3,
+    "acceptedFeedbackRowCount": 3,
+    "excludedFeedbackRowCount": 0,
+    "replacedBaseRowCount": 0,
+    "mergedTrainingRowCount": 147,
+    "decisionDistribution": {"append_new_question": 3}
+  },
+  "result": null,
+  "activation": {
+    "status": "pending",
+    "desiredModelVersion": null,
+    "servingModelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d",
+    "checkedAt": "2026-09-12T07:12:32Z"
+  },
+  "submittedAt": "2026-09-12T06:30:02Z",
+  "startedAt": "2026-09-12T06:30:45Z",
+  "endedAt": null,
+  "lastUpdatedAt": "2026-09-12T07:12:32Z",
+  "stale": false,
+  "warnings": []
+}

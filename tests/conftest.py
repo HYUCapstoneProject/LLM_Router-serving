@@ -66,6 +66,10 @@ class FakeEscalationService:
         return AcceptedRetraining(
             batch_id=request.batchId,
             pipeline_run_id="pipeline-run-123",
+            logical_model_version="1.1",
+            candidate_model_version="router-modernbert-feedback-v1.1-20260812-a1b2c3d4-21c2f1b",
+            training_mode="minor_fine_tune",
+            version_policy_mode="successfulHttpRequest",
         )
 
 
