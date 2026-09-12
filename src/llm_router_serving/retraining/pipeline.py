@@ -9,7 +9,9 @@ from typing import ClassVar, NoReturn, Protocol
 
 class PipelineState(StrEnum):
     ACTIVE = "active"
-    TERMINAL = "terminal"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
     UNKNOWN = "unknown"
 
 
@@ -66,13 +68,11 @@ class VertexPipelineClient:
     as Vertex accepts the job, and the retraining run itself can take hours.
     """
 
-    _TERMINAL_STATES: ClassVar[frozenset[str]] = frozenset(
-        {
-            "PIPELINE_STATE_SUCCEEDED",
-            "PIPELINE_STATE_FAILED",
-            "PIPELINE_STATE_CANCELLED",
-        }
-    )
+    _TERMINAL_STATES: ClassVar[dict[str, PipelineState]] = {
+        "PIPELINE_STATE_SUCCEEDED": PipelineState.SUCCEEDED,
+        "PIPELINE_STATE_FAILED": PipelineState.FAILED,
+        "PIPELINE_STATE_CANCELLED": PipelineState.CANCELLED,
+    }
     _ACTIVE_STATES: ClassVar[frozenset[str]] = frozenset(
         {
             "PIPELINE_STATE_QUEUED",
@@ -170,7 +170,7 @@ class VertexPipelineClient:
             self._raise_mapped(exc, submission=False)
         raw_state = str(getattr(job, "state", "") or "").split(".")[-1].upper()
         if raw_state in self._TERMINAL_STATES:
-            return PipelineState.TERMINAL
+            return self._TERMINAL_STATES[raw_state]
         if raw_state in self._ACTIVE_STATES:
             return PipelineState.ACTIVE
         return PipelineState.UNKNOWN
