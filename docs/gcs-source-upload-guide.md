@@ -466,11 +466,11 @@ gcloud storage buckets list --project="$PROJECT_ID"
 | `.env`, token, JSON key | 사용하지 않음 | Secret Manager와 IAM을 사용 |
 | 실행 중 SQLite DB | 소스 archive에 포함하지 않음 | 배포 시 별도의 영속 저장소 필요 |
 
-### 10-1. 새 버킷을 feedback과 모델 artifact에도 사용할 경우
+### 10-1. 새 버킷을 재학습 artifact와 모델 package에도 사용할 경우
 
 이 문서에서 올린 소스 압축 파일은 백업용이므로 FastAPI가 자동으로 읽지 않는다. 같은
-버킷을 `/escalate` feedback, dataset, config와 모델 artifact에도 사용할 계획이라면 실제
-배포 환경의 `.env`에서 버킷 이름을 맞춰야 한다.
+버킷을 FastAPI가 생성하는 재학습 artifact, dataset, config와 모델 package에도 사용할
+계획이라면 실제 배포 환경의 `.env`에서 버킷 이름을 맞춰야 한다.
 
 최소한 다음 값을 확인한다.
 
@@ -489,11 +489,13 @@ LLM_ROUTER_EVALUATION_CONFIG_URI
 LLM_ROUTER_PACKAGE_METADATA_URI
 LLM_ROUTER_BASELINE_METRICS_URI
 LLM_ROUTER_GATE_RULES_URI
+LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI
 ```
 
-`LLM_ROUTER_ALLOWED_GCS_BUCKETS`에 없는 버킷의 `manifestUri` 또는 `eventsUri`가
-`POST /escalate`로 들어오면 FastAPI가 보안상 거부한다. `.env.example`에는 형식만 남기고,
-실제 값과 secret은 Git이나 GCS 소스 압축 파일에 포함하지 않는다.
+Spring은 `/escalate`에 inline JSON을 보내므로 GCS URI나 GCS IAM 권한이 필요 없다.
+FastAPI 서비스 계정이 `LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI`에 Parquet과 manifest를
+생성하고 이후 replay 정리 시 삭제한다. `.env.example`에는 형식만 남기고, 실제 값과
+secret은 Git이나 GCS 소스 압축 파일에 포함하지 않는다.
 
 ### 10-2. 비용 주의
 
