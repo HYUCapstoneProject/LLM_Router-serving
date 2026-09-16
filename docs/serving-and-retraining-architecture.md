@@ -1,8 +1,8 @@
 # LLM Router Serving 및 재학습 연동 아키텍처
 
-상태: 초기 구현 기준
+상태: 현행 ModernBERT serving·재학습 구현 기준
 
-기준일: 2026-08-13
+기준일: 2026-09-16
 
 ## 1. 목적
 
@@ -10,13 +10,23 @@
 FastAPI 서비스다.
 
 1. 질문을 BGE 계열 모델로 임베딩한다.
-2. 캐시 미스 질문을 ModernBERT로 분류해 `easy`, `medium`, `hard` 중 하나를 반환한다.
-3. Spring이 GCS에 게시한 escalation feedback 1,000건의 metadata를 받아 기존
-   Vertex AI Pipelines 재학습 파이프라인에 연결하고, 승인된 새 모델을 이후 라우팅
-   추론에 반영한다.
+2. 캐시 미스 질문을 현재 ModernBERT router로 분류해 `easy`, `medium`, `hard` 중 하나를
+   반환한다. 향후 backbone 교체 뒤에도 이 HTTP 출력 계약은 유지한다.
+3. Spring이 HTTP로 보낸 escalation feedback event를 검증·artifact화해 기존 Vertex AI
+   Pipelines 재학습 파이프라인에 연결하고, gate를 통과한 새 모델을 이후 라우팅 추론에
+   반영한다.
 
-이 문서는 서비스의 책임 경계와 구현 방향을 정한다. 아직 합의되지 않은 endpoint 이름,
-세부 schema, 모델 교체 방식은 초안으로 표시한다.
+이 문서는 서비스의 책임 경계와 구현 방향을 정한다. 통합 데이터·최종 비교 모델군·threshold와
+ModernBERT-only 재학습 경계는 sibling `LLM_Router` 저장소의
+`docs/ml/integrated-routing-data-and-model-comparison-plan.md`를 우선한다.
+다른 backbone 비교는 Colab notebook에서 끝나며 이 서비스나 Vertex 재학습 pipeline에
+연결하지 않는다. 최초 ModernBERT checkpoint도 Colab에서 학습하며, 이 서비스가 제출하는
+Vertex PipelineJob은 feedback 재학습만 수행한다.
+
+Spring이 재학습용 GCS 객체까지 만들지 않는 이유는 온라인 백엔드를 ML artifact schema와
+cloud storage 운영에 결합시키지 않기 위해서다. Spring은 business event와 trigger만
+소유하고, FastAPI가 HTTP event를 ML 입력으로 바꾸는 anti-corruption boundary가 된다.
+Parquet/manifest/checksum/replay/GCS 변경은 이 경계 안에서만 일어난다.
 
 ## 2. 전체 흐름
 
@@ -42,31 +52,31 @@ FastAPI는 embedding과 난이도 분류만 담당한다. pgvector 조회, cache
 ### 2-2. Feedback 재학습
 
 ```text
-Spring: 유효 escalation feedback 1,000건 취합
-  -> GCS: immutable manifest.json + events.parquet 게시
-  -> FastAPI: batch metadata로 /escalate 요청
-  -> GCS 객체·schema·checksum·행 수 검증
+Spring: 재학습할 escalation feedback 1건 이상 취합·PII 제거
+  -> FastAPI: feedback-inline-v1 JSON으로 /escalate 요청
+  -> FastAPI: schema·label 상승·만족·PII 보증·eventId 중복 검증
+  -> FastAPI: eventId 순 정규화, Parquet·SHA-256·manifest 생성
+  -> FastAPI service account로 cycle/replay artifact를 GCS에 immutable 저장
   -> Vertex AI PipelineJob 제출 (google.cloud.aiplatform)
-       -> CPU: feedback 검증·정규화·중복 제거·기존 학습 데이터 병합
+       -> CPU: feedback 검증·정규화·중복 제거·compact rehearsal 병합
        -> CPU launcher: Vertex AI Custom Training job 제출·감시
        -> Vertex AI T4: 공통 ModernBERT 학습 코어로 재학습
        -> CPU: 평가·package·deploy gate
-       -> rejected 또는 candidate
-  -> 승인된 model package를 FastAPI serving에 반영
-  -> readiness 확인 후 트래픽 전환
-  -> 실패 시 직전 approved model로 rollback
+       -> gate 통과 시 candidate 게시·자동 승인·CURRENT.json 갱신
+  -> FastAPI가 CURRENT.json을 감지해 새 model package를 검증·적재
+  -> 실패 시 직전 loaded model을 계속 사용
 ```
 
 FastAPI는 별도의 학습 loop를 구현하지 않는다. 재학습은 `LLM_Router` 저장소의
-`ML/` 구현과 `docs/ml/` 명세를 그대로 사용한다. 공통 학습 CLI, checkpoint 형식과
+`ml/` 구현과 `docs/ml/` 명세를 그대로 사용한다. 공통 학습 CLI, checkpoint 형식과
 라벨 순서는 로컬과 Vertex AI에서 동일해야 한다.
 
 ## 3. 컴포넌트 책임
 
 | 컴포넌트 | 책임 | 책임이 아닌 것 |
 | --- | --- | --- |
-| Spring Gateway | 공개 chat API, cache 조회·정책, 실제 LLM 선택·호출, escalation 수집, 1,000건 trigger | embedding·ModernBERT 추론, ML 학습 loop |
-| FastAPI serving | BGE inference, ModernBERT inference, 모델 version 노출, 재학습 요청 접수·상태 연결, 승인 모델 반영 | pgvector 직접 조회, cache 판정, 실제 LLM 호출, feedback DB 직접 조회 |
+| Spring Gateway | 공개 chat API, cache 조회·정책, 실제 LLM 선택·호출, escalation 수집·PII 제거·batch trigger·inline 전송 | GCS/Parquet/manifest, embedding·ModernBERT 추론, ML 학습 loop |
+| FastAPI serving | BGE inference, ModernBERT inference, 모델 version 노출, inline feedback 검증·artifact화·pipeline 제출, 승인 모델 반영 | pgvector 직접 조회, cache 판정, 실제 LLM 호출, Spring DB 직접 조회 |
 | Vertex AI Pipelines | feedback 검증·병합, 학습 orchestration, 평가, package, deploy gate와 lineage | 온라인 요청 처리, Spring DB 직접 조회, 현재 serving process 직접 변경 |
 | Vertex AI Custom Training | ModernBERT GPU 재학습 | pipeline 전체 orchestration, serving traffic 전환 |
 | GCS/Artifact Registry | versioned dataset·model·metric과 immutable image 보관 | 승인 정책 결정 |
@@ -91,9 +101,10 @@ endpoint는 `POST /router/embed`다. cache 조회 전에 항상 호출하며, pa
 normalization, 질문 간 대칭 비교에서 prefix 미사용이다. embedding version이 달라지면
 기존 cache vector와 섞지 않는다.
 
-### 4-2. ModernBERT 분류
+### 4-2. 3단계 router 분류
 
-endpoint는 `POST /router/classify`다. cache miss일 때만 호출하며, payload의 단일 기준은
+endpoint는 `POST /router/classify`다. 현재 적재 모델은 ModernBERT이며 cache miss일 때만
+호출한다. payload의 단일 기준은
 [`api-contract.md`](api-contract.md)다.
 
 고정 ML 계약은 다음과 같다.
@@ -107,13 +118,19 @@ endpoint는 `POST /router/classify`다. cache miss일 때만 호출하며, paylo
 
 ## 5. 재학습 API와 비동기 job
 
-재학습 제출 endpoint는 `POST /escalate`다. Spring은 feedback event를 request body에
-직접 넣지 않는다. 먼저 GCS에 변경 불가능한 `manifest.json`과 `events.parquet`을 게시한
-뒤 FastAPI에는 `batchId`, schema version, 두 GCS URI, event count와 요청 시각만 보낸다.
+재학습 제출 endpoint는 `POST /escalate`다. Spring은 feedback event 전체를
+`feedback-inline-v1` JSON request body에 넣어 보낸다. Spring은 Parquet, checksum,
+manifest와 GCS URI를 생성하거나 GCS에 업로드하지 않는다.
 
-FastAPI는 GCS 객체, manifest metadata, checksum과 행 수를 검증한 뒤 Vertex AI pipeline을
-제출하고 `202 Accepted`와 `pipelineRunId`를 반환한다. 이 응답은 pipeline 제출 성공만
-의미하며 학습·평가·배포 성공을 의미하지 않는다.
+FastAPI는 inline schema와 event 의미를 검증하고 이를 기존 ML 계약의 snake_case
+Parquet으로 변환한다. FastAPI가 checksum과 `feedback-export-v0.1` manifest를 만든 뒤
+GCS에 기록하고 Vertex AI pipeline을 제출한다. `202 Accepted`와 `pipelineRunId`는 pipeline
+제출 성공만 의미하며 학습·평가·배포 성공을 의미하지 않는다.
+
+제출 직전 FastAPI는 현재 3-call cycle 전체와 직전 compact replay를 결합한 파생
+manifest/Parquet, 그리고 다음 호출에서 사용할 label별 최대 32행 replay snapshot을
+`LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI`에 immutable하게 기록한다. Spring DB에서
+과거 데이터를 다시 요청하지 않는다.
 
 동일한 `batchId`와 동일한 내용의 재시도에는 기존 `pipelineRunId`를 반환한다. 같은
 `batchId`에 다른 내용이 오거나 다른 재학습이 진행 중이면 `409 Conflict`를 반환한다.
@@ -122,71 +139,88 @@ FastAPI는 GCS 객체, manifest metadata, checksum과 행 수를 검증한 뒤 V
 정확한 요청·응답 schema, 오류 코드와 검증 순서는
 [`api-contract.md`](api-contract.md)를 따른다.
 
-### 5-1. 1,000건 trigger의 의미
+### 5-1. 재학습 trigger와 API batch 크기
 
-Spring이 `/escalate`를 호출하는 기준은 raw DB row가 아니라 중복 제거, PII 제거, 만족
-여부 등 export 조건을 통과한 유효 feedback 1,000건이다. pipeline 내부 validator가
+Spring이 `/escalate`를 호출하는 양과 시점은 Spring이 소유한다. FastAPI는
+`events.length >= 1`과 각 event의 schema·label 상승·만족·PII 제거 보증을 검사한다.
+pipeline validator가
 추가 품질 검사로 일부 행을 격리할 수 있으므로 `received_count`, `accepted_count`,
 `quarantined_count`와 제외 사유별 count는 pipeline metric에 남긴다.
 
+승격까지 성공한 HTTP 호출 3회마다 logical major version이 증가한다. 첫 두 호출은 같은
+`.0` anchor에 cycle feedback을 누적한 minor fine-tuning이고, 세 번째는 동일 anchor와 세
+batch 전체를 사용한 major consolidation이다. major consolidation 5회마다 순정
+ModernBERT와 compact replay로 rebase한다. 상세 계약은 `LLM_Router` 저장소의
+`docs/ml/continual-retraining-strategy.md`를 따른다.
+
 ### 5-2. Pipeline 입력 형식
 
-Spring은 기존 ML 계약에 맞춘 immutable artifact를 GCS에 먼저 게시한다. FastAPI는 해당
-artifact의 URI와 metadata만 받아 검증한 뒤 Vertex AI pipeline에 전달한다.
+FastAPI가 inline event를 기존 ML 계약에 맞춘 immutable artifact로 만들어 Vertex AI
+pipeline에 전달한다.
 
 ```text
-feedback/<batch-id>/manifest.json
-feedback/<batch-id>/events.parquet
+<derived-root>/<candidate-version>/feedback/manifest.json
+<derived-root>/<candidate-version>/feedback/events.parquet
+<derived-root>/<candidate-version>/replay/manifest.json
+<derived-root>/<candidate-version>/replay/events.parquet
 ```
 
 manifest에는 적어도 schema version, batch ID, event count, data URI, SHA-256, producer
-version과 watermark를 기록한다. FastAPI와 pipeline은 ML validator와 공통 학습 코어를
-우회해서는 안 된다.
+version과 watermark를 FastAPI가 기록한다. Spring은 이 내부 artifact를 생성하거나 직접
+읽지 않는다. FastAPI와 pipeline은 ML validator와 공통 학습 코어를 우회해서는 안 된다.
 
-## 6. 모델 승인과 FastAPI 반영
+## 6. 모델 자동 승격과 FastAPI 반영
 
-재학습 완료 checkpoint를 곧바로 운영 모델로 사용하지 않는다. 전달은 **pull 방식**이며
-실행 중인 모델을 교체하는 API는 존재하지 않는다.
+재학습 완료 checkpoint를 곧바로 운영 모델로 사용하지 않는다. 자동 deploy gate와 package
+검증을 통과한 모델만 **pull 방식**으로 반영한다.
 
 ```text
 Vertex AI Pipeline
   -> RouterArena 평가 -> model package -> deploy gate
   -> gs://<bucket>/models/router-modernbert/<version>/candidate/   (pipeline이 게시)
-  -> 승인자가 metrics와 gate_result 확인
-  -> modernbert-publish approve                                    (LLM_Router 저장소)
+  -> pipeline이 modernbert-publish approve 자동 실행
   -> gs://<bucket>/models/router-modernbert/<version>/approved/ + CURRENT.json
-  -> FastAPI 배포 설정에 package URI와 version 전달
-  -> 프로세스 시작 시 다운로드·검증
-  -> rolling restart
-  -> GET /health 200 확인
+  -> FastAPI가 CURRENT.json을 polling
+  -> 새 package를 별도로 다운로드·검증·모델 로드
+  -> 검증 완료 후 in-memory classifier 원자적 교체
 ```
 
 각 단계의 계약은 다음과 같다.
 
 1. pipeline이 평가, package 검증과 deploy gate를 수행한다. gate 실패 모델은 candidate
    경로에 올라가지 않는다.
-2. gate 통과 package만 `candidate/`에 immutable하게 게시된다. 이 단계까지가 pipeline의
-   책임이다.
-3. 승인은 pipeline 밖의 사람이 `modernbert-publish approve`로 수행한다. 이 명령이
+2. gate 통과 package만 `candidate/`에 게시된다.
+3. 다음 pipeline component가 `modernbert-publish approve`를 자동 수행한다. 이 명령이
    package를 `approved/`로 복사하며 `gate_status`를 `approved`로 바꾸고 `CURRENT.json`
    포인터를 GCS generation precondition으로 갱신한다.
-4. 배포 담당자가 `LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI`와
-   `LLM_ROUTER_ROUTER_MODEL_VERSION`을 approved 값으로 바꾼다.
-5. FastAPI는 프로세스 시작 시 package를 내려받아 `model_manifest.json` 기준으로 schema
+4. FastAPI는 `CURRENT.json`을 시작 시 읽고 이후 기본 60초 간격으로 확인한다.
+5. FastAPI는 package를 내려받아 `model_manifest.json` 기준으로 schema
    version, label 순서(`easy=0, medium=1, hard=2`), `model_version`, 파일별 SHA-256을
    검증한다. `gate_status`가 `approved`가 아니면 적재를 거부한다.
-6. 검증을 통과한 뒤에만 cache 디렉터리에 게시되므로, 실패한 다운로드는 사용 가능한
-   모델 디렉터리를 남기지 않고 `/health`는 503을 유지한다.
-7. rolling restart와 `GET /health` readiness probe가 무중단 전환을 보장한다. 새
-   인스턴스는 모델 검증·적재를 마친 뒤에만 트래픽을 받는다.
-8. rollback은 두 환경변수를 직전 approved version으로 되돌리고 재시작하는 것이다.
-   `modernbert-publish rollback`이 `CURRENT.json`을 같은 방향으로 되돌린다.
-
-hot reload와 자동 승인은 도입하지 않는다. 실행 중 모델 교체 대신 재시작을 쓰는 이유는
-승인 시점과 트래픽 전환 시점이 배포 기록에 그대로 남고, 부분적으로 교체된 상태가
-존재할 수 없기 때문이다.
+6. 검증과 모델 로딩이 모두 성공한 뒤에만 classifier 참조를 원자적으로 교체한다. 실패하면
+   직전 모델이 계속 요청을 처리한다.
+7. 진행 중 요청은 이미 얻은 이전 classifier 참조로 완료되고 새 요청부터 새 모델을 쓴다.
+8. rollback은 `modernbert-publish rollback`으로 `CURRENT.json`을 이전 approved package로
+   되돌리며 watcher가 같은 절차로 자동 반영한다.
+9. 승인 완료 후 candidate 중복본을 제거하고 current, previous known-good, 현재 cycle의
+   anchor만 보존해 model storage를 제한한다.
 
 ## 7. 오류·상태·관측성
+
+Spring에서 재학습 lifecycle과 필터링 수치를 조회하는 endpoint는
+`GET /retraining-runs/{batchId}`로 구현되어 있다. 정확한 response와 enum은
+[`api-contract.md`](api-contract.md)의 7장이 기준이며, 실제 유효 feedback batch의
+Vertex/GCS E2E와 activation은 별도 cloud smoke가 남아 있다.
+
+Pipeline `succeeded`는 gate 통과와 approved package 게시, `CURRENT.json` 전환까지다. 실제
+FastAPI 메모리 적재는 별도 `activation.status`로 표현한다. `GET /router/model/current`는
+pointer가 원하는 `desired` model과 현재 추론에 쓰는 `serving` model을 함께 반환한다.
+
+Version trigger mode는 별도 developer API로만 전환한다. 기본 연구 mode는 승격까지 성공한
+HTTP-triggered run 3회이고, 대안은 전처리 후 canonical row가 존재하며 이전과 다른
+canonical digest를 가진 `validatedUniqueBatch` 3회다. mode 변경은 version count를
+초기화하지 않고 이미 제출된 run을 재해석하지 않는다. `/developer/**`는 Spring 연동 범위가
+아니며 별도 token과 network allowlist를 사용한다.
 
 공통 오류 응답 초안:
 
@@ -198,8 +232,9 @@ hot reload와 자동 승인은 도입하지 않는다. 실행 중 모델 교체 
 }
 ```
 
-최소 health endpoint는 embedding model과 router model의 적재 여부 및 version을 각각
-노출해야 한다. 둘 중 하나라도 준비되지 않았으면 readiness는 실패해야 한다.
+`/health`는 embedding/router 적재 readiness만 판정한다. 정확한 router artifact/logical
+version과 hot-swap 상태는 `/router/model/current`가 노출한다. 둘 중 하나라도 준비되지
+않았으면 readiness는 실패해야 한다.
 
 로그와 metric에서 다음 식별자를 연결한다.
 
@@ -215,13 +250,13 @@ hot reload와 자동 승인은 도입하지 않는다. 실행 중 모델 교체 
 
 ## 8. 구현 전에 확정할 항목
 
-- FastAPI endpoint 경로와 camelCase/snake_case 규칙
-- BGE model ID/revision, pooling, normalization, prefix와 차원
-- 요청당 최대 질문 길이, batch 크기, timeout과 concurrency
+- BGE model ID/revision, pooling, normalization, prefix와 차원 변경 여부
+- 요청당 timeout과 concurrency
 - feedback export 조건과 pipeline 추가 격리 정책
 - Vertex PipelineJob·CustomJob service account와 IAM 주체
-- candidate 승인자와 approved GCS 경로
 - FastAPI 장애 시 Spring의 상위 tier fallback 정책
+- 여러 FastAPI replica의 `activation=active` 집계 기준과 SQLite shared store 전환 시점
+- `validatedUniqueBatch` 검증 후 운영 기본 mode로 바꿀 시점
 
 ## 9. 연관 기준 문서
 

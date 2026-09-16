@@ -1,15 +1,19 @@
 # LLM_Router-serving
 
-FastAPI server for ML routing and embedding.
+FastAPI server for ML routing, embedding, and feedback-retraining orchestration. The current
+production-compatible classifier is ModernBERT; the HTTP contract itself is router-backbone neutral.
 
 ## Implemented API
 
 | Method | Path | Behavior |
 | --- | --- | --- |
 | `POST` | `/router/embed` | CLS-pooled, L2-normalized 1,024-dimensional BGE embedding |
-| `POST` | `/router/classify` | ModernBERT `easy`/`medium`/`hard` classification |
-| `GET` | `/health` | BGE and ModernBERT loading/readiness state |
-| `POST` | `/escalate` | Validates a GCS feedback batch and submits the Vertex AI retraining pipeline |
+| `POST` | `/router/classify` | Active router's `easy`/`medium`/`hard` classification |
+| `GET` | `/health` | BGE and router loading/readiness state |
+| `POST` | `/escalate` | Validates inline feedback, materializes GCS artifacts, and submits Vertex retraining |
+| `GET` | `/retraining-runs/{batchId}` | Retraining stage, result, and model-activation status |
+| `GET` | `/router/model/current` | Desired, serving, and previous known-good model status |
+| `GET/PUT` | `/developer/retraining/version-policy` | Developer-only version trigger policy |
 
 The server does not query pgvector or select the actual LLM. Spring owns cache lookup and the
 tier-to-model mapping.
@@ -24,7 +28,8 @@ python3.12 -m venv .venv
 cp .env.example .env
 ```
 
-Configure at least the approved ModernBERT package path and version in `.env`. BGE defaults to
+Configure the active router's `CURRENT.json` pointer (or a fixed approved package and version) in `.env`.
+BGE defaults to
 `BAAI/bge-large-en-v1.5` revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`. Local execution
 downloads it into the Hugging Face cache on first startup. The production Docker image downloads
 only the safetensors and tokenizer files at build time and runs with Hugging Face offline mode, so a
@@ -64,49 +69,57 @@ on a GCE-hosted container use the attached VM service account for GCS and Vertex
 ```bash
 docker run --rm -p 8000:8000 \
   -e LLM_ROUTER_INTERNAL_API_TOKEN=replace-with-secret \
-  -e LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI=gs://llm-router/models/router-modernbert/router-modernbert-base-routerbench-20260731-21c2f1b/approved \
-  -e LLM_ROUTER_ROUTER_MODEL_VERSION=router-modernbert-base-routerbench-20260731-21c2f1b \
+  -e LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI=gs://llm-router/models/router-modernbert/CURRENT.json \
   -v /absolute/path/to/persistent-var:/app/var \
   llm-router-serving:0.1.0
 ```
 
 Set `LLM_ROUTER_MODEL_DEVICE=cuda` only on a GPU node with a compatible NVIDIA container runtime;
 otherwise the default `auto` selects CUDA when available and CPU otherwise. Readiness must probe
-`GET /health`; it returns HTTP 503 until both BGE and ModernBERT have loaded.
+`GET /health`; it returns HTTP 503 until both BGE and the router have loaded.
 
 ## Approved model delivery
 
-Model delivery is pull-based and there is no endpoint that swaps a loaded model. The Vertex AI
-pipeline publishes a checksummed package to GCS, a human approves it, and the deployment is then
-configured with the approved URI and version:
+Model delivery is pull-based and automatic. The Vertex AI pipeline evaluates the checkpoint,
+enforces the deploy gate, publishes the checksummed package, marks it approved, and atomically moves
+`CURRENT.json`. The serving process polls that pointer and swaps only a fully downloaded and verified
+classifier:
 
 ```text
 Vertex AI Pipeline -> evaluate -> deploy gate
   -> gs://<bucket>/models/router-modernbert/<version>/candidate/
-  -> modernbert-publish approve (LLM_Router repository)
-  -> gs://<bucket>/models/router-modernbert/<version>/approved/ and CURRENT.json
-  -> deployment sets LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI and LLM_ROUTER_ROUTER_MODEL_VERSION
-  -> rolling restart: download, verify, load
-  -> GET /health returns 200
+  -> automatic approve -> <version>/approved/ and atomic CURRENT.json update
+  -> FastAPI notices CURRENT.json, downloads and verifies the package beside the active model
+  -> atomic in-memory classifier swap; in-flight requests finish on the previous model
 ```
 
-Set exactly one model source. `LLM_ROUTER_ROUTER_MODEL_PATH` points at a local directory for
-development; `LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI` points at the approved GCS prefix for
-deployment. Setting both is rejected at startup.
+`LLM_ROUTER_ROUTER_MODEL_PATH` is the development source. Deployment should set
+`LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI`; when it is omitted, the service derives
+`CURRENT.json` from `LLM_ROUTER_MODEL_PUBLISH_ROOT_URI`. A fixed
+`LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI` plus version remains available for bootstrap and rollback
+compatibility.
 
-During startup the process downloads the package into `LLM_ROUTER_ROUTER_MODEL_CACHE_DIR`
+During startup and every pointer refresh the process downloads the package into
+`LLM_ROUTER_ROUTER_MODEL_CACHE_DIR`
 (default `var/models/<version>`) and verifies it against `model_manifest.json`: schema version,
 `easy=0, medium=1, hard=2` label order, `model_version`, and the SHA-256 of every listed file. With
 `LLM_ROUTER_ROUTER_MODEL_REQUIRE_APPROVED=true` (the default) a package whose `gate_status` is not
 `approved` is refused, so a candidate can never be served by accident. Verification runs before the
 directory is published into the cache, so a failed download leaves no usable model behind, and
-`/health` stays 503.
+the active classifier remains unchanged. `LLM_ROUTER_ROUTER_MODEL_POLL_INTERVAL_SECONDS` controls
+the refresh interval and defaults to 60 seconds.
 
-Mount the cache directory on the same persistent volume as `var` to avoid re-downloading the
-package on every container replacement. A rolling restart with `GET /health` as the readiness probe
-is what makes the swap safe: a new instance only receives traffic once its model is verified and
-loaded. Rolling back means pointing the two variables at the previous version and restarting;
-`modernbert-publish rollback` moves the `CURRENT.json` pointer to match.
+Mount the cache directory on the same persistent volume as `var` to avoid re-downloading packages.
+Reload is load-before-swap: a corrupt or incompatible new package leaves the last known-good model
+serving. `modernbert-publish rollback` moves `CURRENT.json` to the previous approved package, and the
+same watcher automatically loads it.
+
+The current package/loader contract intentionally remains ModernBERT sequence-classification v1.
+MiniLM, RoBERTa, DeBERTa, Qwen, and TF-IDF are trained/evaluated only in the sibling repository's
+Colab comparison notebooks; they are never submitted through this service's KFP/Vertex path. This
+service does not load or continually retrain them. Keep `models/router-modernbert/CURRENT.json` as
+the sole automatic promotion pointer. A future family migration requires a separate decision and
+implementation.
 
 ## Retraining configuration
 
@@ -116,6 +129,15 @@ loaded. Rolling back means pointing the two variables at the previous version an
 repository; the IR is read from GCS, not from the serving image.
 `LLM_ROUTER_MODEL_CODE_COMMIT` must be the Git commit used by the retraining image and is included in
 the candidate model version.
+
+The current continual policy accepts any request with at least one inline event. Spring sends the
+full event array and FastAPI owns Parquet/manifest/GCS materialization. Three successfully promoted
+HTTP calls advance `n.0 -> n.1 -> n.2 -> (n+1).0`; every fifth major consolidation initializes from
+the pinned pristine ModernBERT instead of the approved anchor. FastAPI materializes the current
+three-call cycle plus a label-stratified replay capped by
+`LLM_ROUTER_RETRAINING_REPLAY_ROWS_PER_LABEL`, while the ML pipeline adds a 144-row deterministic
+RouterBench rehearsal set. The call-count trigger is intentionally fixed at three for the current
+research phase.
 
 Submission uses `google.cloud.aiplatform.PipelineJob` against managed Vertex AI Pipelines. GKE and
 self-hosted Kubeflow are not used. The Vertex `job_id` is derived deterministically from `batchId`,
@@ -146,17 +168,19 @@ What to do with each group of variables the first time you configure a project:
 | --- | --- | --- |
 | `LLM_ROUTER_GATE_RULES_URI` | Point at `config/<version>/deploy_gate_rules_smoke.json` — a loose gate that only checks package integrity and the candidate model version, so a first run can pass the gate and exercise the full publish path | Switch to a real `deploy_gate_rules.json` with thresholds derived from the actual baseline metrics |
 | `LLM_ROUTER_BASELINE_METRICS_URI` | Point at `config/<version>/baseline_metrics_empty.json` (`{}`) — there is no approved model to compare against yet | Switch to `evaluations/<baseline-version>/metrics.json` from the approved baseline |
-| `LLM_ROUTER_BASE_TRAINING_DATASET_URI` | Only required for the **retraining** pipeline (`/escalate`), not the initial training pipeline. If you have not uploaded the pre-built v2 `training.parquet` to GCS yet, `/escalate` submissions will fail at import time even though the app starts fine | Should already point at the dataset the current approved model was trained on |
-| `LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI`, `LLM_ROUTER_ROUTER_MODEL_VERSION` | Safe to leave as a placeholder if no model has been approved yet. The embedding model still loads independently; the router slot reports `ERROR` and `GET /health` stays `503` until a real approved package exists | Point at the actual `approved/` package once one exists |
+| `LLM_ROUTER_BASE_TRAINING_DATASET_URI` | Required only for the **feedback-retraining** pipeline (`/escalate`). Initial ModernBERT training runs in Colab and does not use this service setting. If the approved base `training.parquet` is absent from GCS, `/escalate` submissions fail at import time even though the app starts | Should point at the dataset the current approved model was trained on |
+| `LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI` | Point at the publish root's `CURRENT.json`. Until the first model is approved the router slot reports `ERROR` and `GET /health` stays `503` | Keep the same pointer; automatic promotions move it without changing deployment settings |
 | `LLM_ROUTER_INTERNAL_API_TOKEN` | Any local secret works for development; leaving it unset disables auth entirely (dev only) | A real secret, provisioned via Secret Manager in deployment, never committed |
 | `LLM_ROUTER_MODEL_CODE_COMMIT` | The Git commit actually baked into the training image you pushed (`git rev-parse --short HEAD` at build time), not whatever was last committed to this repo | Re-set on every training image rebuild |
+| `LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI` | A dedicated immutable prefix for cycle/replay Parquet written by FastAPI | Keep separate from the Vertex pipeline root so temporary-artifact lifecycle rules cannot delete the active replay |
 
 `smoke` config filenames are a deliberate signal, not a suggestion — never point production traffic
 at `deploy_gate_rules_smoke.json`. See `docs/ml/gcp-rollout-and-serving-integration-plan.md` in the
 sibling `LLM_Router` repository for the commands that create and upload the GCS layout these
 variables assume (bucket structure, `config/<version>/` prefix, service accounts, image digests).
 
-The service persists `batchId`, request fingerprint, pipeline run ID, and state in
+The service persists `batchId`, request fingerprint, pipeline run ID, state, logical version,
+anchor lineage, and derived feedback/replay URIs in
 `LLM_ROUTER_RETRAINING_DB_PATH`. Mount that path on persistent storage in deployment; otherwise a
 container replacement would lose the idempotency record.
 
@@ -171,10 +195,12 @@ multiple replicas, replace it with a shared transactional database or distribute
 one-pipeline-at-a-time rule remains global.
 
 GCS and Vertex AI access use the runtime's attached Google identity (Application Default
-Credentials). Do not put service-account JSON keys in the image or repository. The runtime service
-account needs `roles/aiplatform.user` to submit pipeline jobs, `roles/storage.objectViewer` to read
-feedback batches and download approved packages, and `roles/iam.serviceAccountUser` on the pipeline
-service account it passes to Vertex.
+Credentials). Do not put service-account JSON keys in the image or repository. Spring does not need
+GCS access for `/escalate`; it sends inline JSON. The FastAPI runtime service account needs
+`roles/aiplatform.user` to submit pipeline jobs, object read access for model/config packages,
+object create access on `LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI`, and
+`roles/iam.serviceAccountUser` on the pipeline service account it passes to Vertex. Scope the GCS
+permissions to the relevant buckets or prefixes rather than granting project-wide administration.
 
 ## Verification
 
@@ -190,6 +216,11 @@ cloud jobs.
 
 ## Documentation
 
+- [Integrated Colab comparison/initial training and ModernBERT feedback-retraining plan](../LLM_Router/docs/ml/integrated-routing-data-and-model-comparison-plan.md)
 - [FastAPI internal API contract](docs/api-contract.md)
+- [Spring backend integration handoff](docs/backend-integration-handoff.md)
+- [Inline escalation feedback v1](docs/escalation-feedback-inline-v1.md)
+- [Legacy GCS escalation feedback batch v0.1](docs/escalation-feedback-batch-v0.1.md)
+- [Retraining API implementation and rollout plan](docs/retraining-api-implementation-plan.md)
 - [Serving and retraining architecture](docs/serving-and-retraining-architecture.md)
 - [FastAPI source upload to GCS guide](docs/gcs-source-upload-guide.md)

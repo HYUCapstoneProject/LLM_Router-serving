@@ -1,220 +1,134 @@
 # FastAPI 내부 API 계약
 
-상태: 구현 기준 초안
+상태: Spring 연동 기준 문서
 
-기준일: 2026-08-13
+기준일: 2026-09-16
 
-호출자: Spring Server
+이 문서는 Spring과 `LLM_Router-serving` 사이의 HTTP 계약을 정의한다. 재학습 입력은
+`feedback-inline-v1` JSON 하나로 통일한다. Spring은 Parquet, manifest, checksum 또는 GCS
+URI를 만들지 않는다.
 
-## 1. 범위
+RouterBench+xRouteBench 통합 데이터, 모델 비교, threshold·Vertex/GCS·serving 변경의
+실행 기준은 sibling 저장소의
+[`integrated-routing-data-and-model-comparison-plan.md`](../../LLM_Router/docs/ml/integrated-routing-data-and-model-comparison-plan.md)다.
+여러 backbone은 모델별 Colab notebook의 offline 비교에만 사용하고 KFP/Vertex에 올리지
+않는다. ModernBERT 초기학습도 Colab에서 수행하며 Vertex GPU 학습은 feedback 재학습부터
+사용한다. continual retraining·자동 승격·FastAPI 적재는 ModernBERT만 대상으로 한다.
+비교 실험은 이 HTTP v1을 변경하지 않으며, 내부
+ModernBERT package metadata 변경도 Spring payload에 전파하지 않는다.
 
-이 문서는 Spring Server가 `LLM_Router-serving` FastAPI Server에 호출하는 내부 API를
-정의한다.
+### 이 책임 경계를 선택한 이유
 
-| Method | Path | 호출 시점 | 목적 |
-| --- | --- | --- | --- |
-| `POST` | `/router/embed` | cache 조회 전 항상 | 질문의 BGE embedding 생성 |
-| `POST` | `/router/classify` | cache miss일 때만 | ModernBERT 기반 난이도 분류 |
-| `GET` | `/health` | readiness 및 장애 진단 | embedding/router model 적재 상태 확인 |
-| `POST` | `/escalate` | 유효 feedback 1,000건 게시 후 | Vertex AI 재학습 pipeline 제출 |
+재학습은 FastAPI와 ML pipeline의 내부 구현이다. Spring에 GCS upload까지 맡기면 Spring이
+HTTP용 event DTO와 ML용 Parquet/manifest를 동시에 유지해야 하고, GCS SDK·bucket
+경로·checksum·artifact schema·IAM 변경에도 함께 대응해야 한다. 이는 같은 데이터를 두
+서버에서 중복 가공하게 만들고 Spring을 학습 인프라에 결합시킨다.
 
-이 API는 사용자에게 직접 공개하지 않는다. Spring Server가 cache와 실제 LLM routing
-정책을 소유하고, FastAPI Server는 embedding·분류 inference와 재학습 pipeline 제출을
-담당한다.
+따라서 Spring의 학습 관련 책임은 “재학습할 event를 선택하고 PII를 제거해 HTTP로
+전송한다”까지로 제한한다. FastAPI가 ML 계약을 소유하면서 검증·정규화·Parquet·manifest·GCS
+게시·Vertex 제출을 한 경계에서 처리한다. 결과적으로:
 
-## 2. 공통 계약
+- Spring에는 재학습용 GCS SDK, URI 조립 코드와 GCS IAM이 필요 없다.
+- ML artifact schema가 바뀌어도 FastAPI/ML만 함께 변경하면 된다.
+- checksum, replay, version lineage와 immutable 저장을 한 곳에서 일관되게 통제한다.
+- Spring은 public service와 business trigger에 집중하고 학습 인프라 장애를 직접 다루지 않는다.
 
-### 2-1. 전송 형식
+## 1. 책임과 endpoint
 
-- 요청과 응답의 `Content-Type`은 `application/json`이다. `/health` 요청에는 body가 없다.
-- JSON 필드명은 Spring 계약에 맞춰 camelCase를 사용한다.
-- 시간은 UTC ISO 8601 형식으로 전달한다. 예: `2026-08-12T15:30:00Z`.
-- 알 수 없는 필드의 허용 여부는 구현 시 한 가지 정책으로 고정한다. 재학습 요청은 잘못된
-  metadata를 조기에 찾기 위해 알 수 없는 필드를 거부하는 방식을 권장한다.
+Spring의 학습 관련 책임은 재학습 event 선택, PII 제거와 HTTP 전송까지다. FastAPI는
+HTTP event 검증부터 ML artifact 생성, GCS 저장, Vertex 제출, 상태 변환과 승인 model
+반영까지 맡는다.
 
-### 2-2. Request ID
+| Endpoint | 용도 | 호출 주체 |
+| --- | --- | --- |
+| `POST /router/embed` | 질문 embedding | Spring |
+| `POST /router/classify` | 난이도 분류 | Spring |
+| `GET /health` | inference readiness | load balancer·운영 도구 |
+| `POST /escalate` | inline feedback 접수와 재학습 제출 | Spring |
+| `GET /retraining-runs/{batchId}` | 재학습 단계·최종 결과·model 활성화 조회 | Spring |
+| `GET /router/model/current` | 현재 승인/serving model 조회 | Spring·운영 도구 |
+| `GET/PUT /developer/retraining/version-policy` | version trigger mode 조회·변경 | 개발자 도구만 |
 
-Spring Server는 `/router/embed`, `/router/classify`, `/escalate` 요청마다
-`X-Request-ID` header를 전달한다. FastAPI Server는 이 값을 로그와 metric에 보존하고
-오류 응답의 `requestId`와 모든 응답의 `X-Request-ID` header로 반환한다. header가 없으면
-FastAPI Server가 UUID를 생성한다.
+## 2. 공통 HTTP 규칙
 
-### 2-3. 내부 인증
+- 기본 URL은 환경별 설정값으로 관리한다. VM IP, GCP region 또는 hostname을 코드에
+  하드코딩하지 않는다.
+- JSON 요청은 `Content-Type: application/json; charset=utf-8`로 보낸다.
+- 인증이 설정된 환경에서는 `Authorization: Bearer <internal-token>`을 보낸다.
+- 모든 요청에 Spring이 생성한 `X-Request-ID`를 보내는 것을 권장한다. FastAPI는 같은 값을
+  응답 header에 반환하며, 없으면 새 UUID를 생성한다.
+- 알 수 없는 JSON 필드는 거부한다.
+- 모든 시각은 UTC ISO 8601 문자열로 보내며 `Z` 표기를 권장한다.
 
-모든 endpoint는 외부 인터넷에 직접 노출하지 않는다. `LLM_ROUTER_INTERNAL_API_TOKEN`이
-설정된 환경에서는 Spring이 `Authorization: Bearer <token>`을 전달해야 한다. 로컬 개발에서
-변수가 없으면 application-level 인증을 생략할 수 있지만 운영에서는 network policy와
-token 또는 더 강한 workload identity/mTLS 계층을 반드시 적용한다.
-
-- 인증 정보 없음 또는 유효하지 않음: `401 Unauthorized`
-- 인증은 되었으나 해당 작업 권한 없음: `403 Forbidden`
-- credential, token과 질문 원문은 일반 로그에 남기지 않는다.
-
-readiness probe가 `/health`를 호출하는 경우에는 애플리케이션 endpoint와 분리된 network
-policy 또는 probe 전용 인증 예외를 명시적으로 구성한다.
-
-### 2-4. 공통 오류 body
-
-```json
-{
-  "error": "요청을 처리할 수 없습니다.",
-  "code": "ROUTER_NOT_READY",
-  "requestId": "req-123"
-}
-```
-
-| 필드 | 타입 | 필수 | 설명 |
-| --- | --- | --- | --- |
-| `error` | string | Y | credential이나 내부 stack trace를 포함하지 않는 설명 |
-| `code` | string | Y | Spring이 분기와 metric에 사용할 안정적인 오류 코드 |
-| `requestId` | string | Y | 요청 상관관계 ID |
-
-HTTP status와 `code`는 함께 사용한다. Spring은 사람이 읽는 `error` 문자열을 분기
-조건으로 사용하지 않는다.
-
-## 3. `POST /router/embed`
-
-### 3-1. 목적과 호출 조건
-
-질문의 embedding vector를 생성한다. cache 조회가 embedding을 선행 요구하므로 cache
-hit 여부와 관계없이 모든 chat 요청에서 먼저 호출한다.
-
-FastAPI Server는 vector만 생성한다. 응답 vector로 pgvector를 조회하고 cache hit 여부를
-판정하는 주체는 Spring Gateway다.
-
-### 3-2. Request
+공통 오류 body는 다음과 같다.
 
 ```json
 {
-  "message": "string"
+  "error": "request body does not match the API contract",
+  "code": "REQUEST_VALIDATION_FAILED",
+  "requestId": "0f1d3f52-f560-4b0b-93d0-acde58745ae1"
 }
 ```
 
-| 필드 | 타입 | 필수 | 검증 |
-| --- | --- | --- | --- |
-| `message` | string | Y | 빈 문자열이 아니어야 한다. 최대 길이는 tokenizer 계약과 함께 확정한다. |
+Spring은 사람이 읽는 `error`가 아니라 안정된 `code`로 분기하고, 문의·로그 연결에는
+`requestId`를 사용한다.
 
-### 3-3. Success response
+## 3. 온라인 추론 API
 
-Status: `200 OK`
+### 3.1 `POST /router/embed`
+
+Request:
+
+```json
+{
+  "message": "How does photosynthesis work?"
+}
+```
+
+Success: `200 OK`
 
 ```json
 {
   "embedding": [0.0123, -0.0456],
   "dim": 1024,
-  "modelVersion": "bge-large-en-v1.5"
+  "modelVersion": "bge-large-en-v1.5-d4aa690"
 }
 ```
 
-| 필드 | 타입 | 필수 | 설명 |
-| --- | --- | --- | --- |
-| `embedding` | number[] | Y | L2 정규화된 1,024차원 유한 실수 vector |
-| `dim` | integer | Y | 항상 `1024` |
-| `modelVersion` | string | Y | embedding model 및 preprocessing 계약 version |
+`embedding`은 FastAPI에서 L2 정규화된 1,024차원 vector다. Spring은
+`modelVersion`이 다른 embedding을 같은 cache 공간에서 비교하지 않는다.
 
-Spring은 `modelVersion`을 `request_log`에 기록한다. embedding model 또는 preprocessing
-계약을 변경하면 기존 cache vector와 새 vector를 같은 version처럼 비교하면 안 된다.
+### 3.2 `POST /router/classify`
 
-### 3-4. 고정해야 할 embedding 규격
+Request는 `/router/embed`와 같다.
 
-아래 규격은 EXP-003 측정 코드와 완전히 같아야 한다. 한 항목이라도 달라지면 명시적인
-오류 없이 cache 정확도만 낮아질 수 있다.
-
-| 항목 | 값 | 이유 |
-| --- | --- | --- |
-| 차원 | `1024` | pgvector `vector(1024)`와 일치해야 한다. |
-| L2 정규화 | 정규화해서 반환 | pgvector `<=>` cosine distance에서 `similarity = 1 - distance`를 동일한 threshold 의미로 사용하기 위해 필요하다. |
-| pooling | CLS | 공식 `1_Pooling/config.json`과 Transformers 사용 예제가 CLS pooling을 사용한다. |
-| BGE prefix | 사용하지 않음 | semantic cache는 질문과 질문의 대칭 비교다. 저장과 조회 중 한쪽에만 prefix를 붙이면 유사도가 낮아진다. |
-
-model ID, revision, tokenizer, pooling, normalization, prefix와 출력 차원을 하나의
-versioned embedding 계약으로 관리한다.
-
-### 3-5. 오류
-
-| Status | Code | 조건 |
-| --- | --- | --- |
-| `400 Bad Request` | `INVALID_MESSAGE` | `message`가 비어 있거나 허용 길이를 위반 |
-| `401 Unauthorized` | `UNAUTHORIZED` | 내부 인증 실패 |
-| `403 Forbidden` | `FORBIDDEN` | 호출 권한 없음 |
-| `503 Service Unavailable` | `EMBED_MODEL_NOT_READY` | BGE model이 아직 적재되지 않았거나 error 상태 |
-| `500 Internal Server Error` | `EMBEDDING_INFERENCE_FAILED` | 적재 완료 후 inference 실패 |
-
-## 4. `POST /router/classify`
-
-### 4-1. 목적과 호출 조건
-
-cache miss 질문을 ModernBERT로 분류해 `easy`, `medium`, `hard` 중 하나를 반환한다.
-cache hit이면 호출하지 않는다.
-
-### 4-2. Request
+Success: `200 OK`
 
 ```json
 {
-  "message": "string"
+  "tier": "medium",
+  "model": "sonnet",
+  "confidence": 0.87,
+  "modelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d"
 }
 ```
 
-| 필드 | 타입 | 필수 | 검증 |
-| --- | --- | --- | --- |
-| `message` | string | Y | 빈 문자열이 아니어야 한다. 최대 길이와 truncation 관측 방법은 tokenizer 계약을 따른다. |
+- `tier`: `easy | medium | hard`
+- `model`: `haiku | sonnet | opus`
+- `confidence`: `0.0` 이상 `1.0` 이하
+- `modelVersion`: 분류에 실제 사용된 immutable router model version
 
-### 4-3. Success response
+Spring은 `model`을 참고값으로만 사용하고 실제 provider model ID 선택은 자체 versioned
+routing policy로 관리한다. `modelVersion`은 이후 escalation event의
+`routerModelVersion`으로 보존한다.
 
-Status: `200 OK`
+`confidence`는 active ModernBERT가 내는 세 label 점수를 validation에서 정한 방식으로
+확률화·보정한 0~1 값이어야 한다. offline 비교 backbone의 raw logit이나 생성 확률을
+이 API 값으로 보내지 않는다.
 
-```json
-{
-  "tier": "easy",
-  "model": "haiku",
-  "confidence": 0.83,
-  "modelVersion": "router-modernbert-base-routerbench-20260731-21c2f1b"
-}
-```
+### 3.3 `GET /health`
 
-| 필드 | 타입 | 필수 | 설명 |
-| --- | --- | --- | --- |
-| `tier` | enum | Y | `easy`, `medium`, `hard` 중 하나 |
-| `model` | enum | Y | `haiku`, `sonnet`, `opus` 중 하나인 참고값 |
-| `confidence` | number | Y | 선택한 tier의 confidence, `0.0` 이상 `1.0` 이하 |
-| `modelVersion` | string | Y | 판정을 생성한 immutable router model version |
-
-ML label 순서는 `easy=0`, `medium=1`, `hard=2`로 고정한다.
-
-`modelVersion`은 `router-{model}-{dataset}-{date}-{shortCommit}` 명명 규칙을 사용하며
-Spring이 `request_log`에 저장한다. 이 값은 재학습 전후 model의 판정과 escalation 비율을
-분리해 분석하는 데 필수다.
-
-`confidence`가 낮아도 `tier`는 항상 반환한다. Spring은 confidence threshold로 routing을
-분기하지 않고 기록과 사후 분석에만 사용한다.
-
-`model`은 참고값이다. 실제 tier-to-model mapping의 소유자는 Spring의 versioned
-`application.yml` 설정이다. FastAPI 응답과 Spring 설정이 다르면 Spring 설정이 우선한다.
-mapping만 바뀐 경우 ModernBERT를 재학습하거나 FastAPI를 재배포할 필요가 없어야 한다.
-
-### 4-4. 오류
-
-| Status | Code | 조건 |
-| --- | --- | --- |
-| `400 Bad Request` | `INVALID_MESSAGE` | `message`가 비어 있거나 허용 길이를 위반 |
-| `401 Unauthorized` | `UNAUTHORIZED` | 내부 인증 실패 |
-| `403 Forbidden` | `FORBIDDEN` | 호출 권한 없음 |
-| `503 Service Unavailable` | `ROUTER_MODEL_NOT_READY` | ModernBERT가 아직 적재되지 않았거나 error 상태 |
-| `500 Internal Server Error` | `ROUTER_INFERENCE_FAILED` | 적재 완료 후 inference 실패 |
-
-## 5. `GET /health`
-
-### 5-1. 목적
-
-FastAPI process와 BGE·ModernBERT model의 적재 상태를 반환한다. 배포 readiness 판정과
-로컬 통합 장애 진단에 사용한다.
-
-BGE-large와 ModernBERT는 process 시작 후 적재 시간이 필요하므로 process가 실행 중인
-상태와 실제 요청을 받을 준비가 된 상태를 구분한다.
-
-### 5-2. Ready response
-
-Status: `200 OK`
+Ready: `200 OK`
 
 ```json
 {
@@ -224,87 +138,121 @@ Status: `200 OK`
 }
 ```
 
-### 5-3. Not-ready response
-
-Status: `503 Service Unavailable`
+두 model 중 하나라도 준비되지 않으면 같은 schema로 `503 Service Unavailable`을 반환한다.
 
 ```json
 {
   "status": "not_ready",
-  "embedModel": "loading",
-  "routerModel": "loaded"
+  "embedModel": "loaded",
+  "routerModel": "loading"
 }
 ```
 
-| 필드 | 타입 | 가능한 값 | 설명 |
-| --- | --- | --- | --- |
-| `status` | enum | `ok`, `not_ready` | 전체 readiness |
-| `embedModel` | enum | `loaded`, `loading`, `error` | BGE 적재 상태 |
-| `routerModel` | enum | `loaded`, `loading`, `error` | ModernBERT 적재 상태 |
+`/health`는 load balancer의 readiness 용도다. 현재 model version을 확인하는 API가 아니다.
 
-두 model 중 하나라도 `loaded`가 아니면 `status=not_ready`와 HTTP `503`을 반환한다.
-health 응답에 실제 embedding/router model version을 추가할지는 구현 전에 확정한다.
+## 4. `POST /escalate`
 
-## 6. `POST /escalate`
+### 4.1 책임과 처리 순서
 
-### 6-1. 목적과 호출 조건
+Spring은 재학습 대상으로 결정한 event를 1건 이상 한 요청에 담는다. HTTP 호출 시점과
+event 수는 Spring의 정책이다. FastAPI에는 1,000건 조건이나 애플리케이션 수준의 최대 건수
+조건이 없다.
 
-유효한 Escalation Log가 1,000건 누적되면 Spring Server가 immutable feedback batch를
-GCS에 게시한 뒤 FastAPI Server에 Vertex AI 재학습 pipeline 제출을 요청한다.
+```text
+Spring DB
+  -> PII 제거와 전송 대상 선택
+  -> POST /escalate: feedback-inline-v1 JSON
+  -> FastAPI schema·의미·중복 검증
+  -> eventId 순 정규화
+  -> snake_case Parquet 변환
+  -> SHA-256 + feedback-export-v0.1 manifest 생성
+  -> 현재 3-call cycle + compact replay 구성
+  -> FastAPI service account로 GCS에 immutable 저장
+  -> Vertex AI PipelineJob 제출
+  <- 202 Accepted + batchId + pipelineRunId
+```
 
-1,000건은 raw DB row 수가 아니라 중복 제거, PII 제거, 사용자 만족 여부 등 합의된 export
-조건을 통과한 유효 feedback 수다. Spring은 event 1,000건을 request body에 넣지 않고
-GCS 객체 위치와 metadata만 전달한다.
+GCS는 Vertex 학습에 필요한 내구성 있는 내부 artifact 저장소로 계속 사용한다. 다만 GCS
+SDK, bucket 이름, object URI, checksum, manifest와 IAM은 모두 FastAPI/ML 책임이다.
 
-### 6-2. Request
+### 4.2 Request header
+
+```http
+POST /escalate
+Content-Type: application/json; charset=utf-8
+Authorization: Bearer <internal-token>
+X-Request-ID: req-retrain-20260912-0001
+```
+
+### 4.3 Request body
 
 ```json
 {
-  "batchId": "feedback-20260812-0001",
-  "schemaVersion": "feedback-export-v0.1",
-  "manifestUri": "gs://llm-router/datasets/feedback/feedback-20260812-0001/manifest.json",
-  "eventsUri": "gs://llm-router/datasets/feedback/feedback-20260812-0001/events.parquet",
-  "eventCount": 1000,
-  "requestedAt": "2026-08-12T15:30:00Z"
+  "batchId": "feedback-20260912-0001",
+  "schemaVersion": "feedback-inline-v1",
+  "requestedAt": "2026-09-12T06:30:00Z",
+  "events": [
+    {
+      "eventId": "esc-284391",
+      "requestId": "req-019c1234",
+      "question": "Explain why the sky appears blue.",
+      "initialLabel": "easy",
+      "initialModel": "haiku",
+      "finalLabel": "medium",
+      "finalModel": "sonnet",
+      "userSatisfied": true,
+      "escalationCount": 1,
+      "createdAt": "2026-09-12T06:27:41Z",
+      "routerModelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d",
+      "piiRedacted": true
+    }
+  ]
 }
 ```
 
-| 필드 | 타입 | 필수 | 검증 |
-| --- | --- | --- | --- |
-| `batchId` | string | Y | immutable batch 식별자이자 멱등성 키 |
-| `schemaVersion` | string | Y | FastAPI와 ML pipeline이 지원하는 feedback schema |
-| `manifestUri` | string | Y | 접근 가능한 `gs://` manifest 객체 URI |
-| `eventsUri` | string | Y | 접근 가능한 `gs://` Parquet 객체 URI |
-| `eventCount` | integer | Y | `1000`, request·manifest·Parquet 행 수가 일치해야 함 |
-| `requestedAt` | string | Y | UTC ISO 8601 요청 생성 시각 |
+Top-level 필드:
 
-manifest는 다음 필드를 모두 포함해야 한다. 이 목록은 ML pipeline의
-`REQUIRED_MANIFEST_FIELDS`(`LLM_Router` 저장소의
-`ml/src/llm_router_labeling/training/feedback_retraining_preprocessing.py`)와 같아야 하며,
-한쪽만 바꾸면 `/escalate`가 202로 받아들인 batch가 pipeline 안에서 실패한다.
+| 필드 | JSON 타입 | 필수 | 규칙 |
+| --- | --- | :---: | --- |
+| `batchId` | string | Y | 1~200자, `[A-Za-z0-9._-]+`; immutable 멱등성 키 |
+| `schemaVersion` | string | Y | 정확히 `feedback-inline-v1` |
+| `requestedAt` | string | Y | UTC ISO 8601 요청 생성 시각 |
+| `events` | array | Y | 1개 이상; 요청 안에서 `eventId` 고유 |
+
+`events[]` 필드:
+
+| 필드 | JSON 타입 | 필수 | 규칙 |
+| --- | --- | :---: | --- |
+| `eventId` | string | Y | 비공백, 최대 200자, 요청 배열 안에서 고유 |
+| `requestId` | string | Y | 원 사용자 요청 ID, 비공백, 최대 200자 |
+| `question` | string | Y | 실제 PII 제거가 끝난 원 질문, 비공백, 최대 100,000자 |
+| `initialLabel` | string | Y | 최초 router tier: `easy | medium | hard` |
+| `initialModel` | string | Y | 최초 응답 model 식별자, 비공백, 최대 300자 |
+| `finalLabel` | string | Y | 만족 응답 tier; `initialLabel`보다 반드시 높음 |
+| `finalModel` | string | Y | 만족 응답 model 식별자, 비공백, 최대 300자 |
+| `userSatisfied` | boolean | Y | JSON boolean `true`만 허용 |
+| `escalationCount` | integer | Y | 해당 요청 안에서 상향 호출한 횟수, 1 이상 |
+| `createdAt` | string | Y | event 생성 시각, UTC ISO 8601 |
+| `routerModelVersion` | string | Y | 최초 분류에 사용된 router model version |
+| `piiRedacted` | boolean | Y | 실제 PII 제거를 완료한 뒤 `true` |
+
+허용되는 label 이동은 `easy -> medium`, `easy -> hard`, `medium -> hard`다. 같은 label 또는
+하향 이동은 재학습 불만 event가 아니므로 거부한다.
+
+다음 필드는 **존재하지 않으며 보내면 422**다.
 
 ```text
-schema_version
-batch_id
-created_at
-window_start
-window_end
-event_count
-data_format
-data_uri
-sha256
-producer_version
-watermark
+eventCount, manifestUri, eventsUri
 ```
 
-- `created_at`, `window_start`, `window_end`는 UTC ISO 8601이며 `window_start`가
-  `window_end`보다 늦으면 안 된다. timezone이 없는 값은 UTC로 해석한다.
-- `data_format`은 `parquet`이어야 한다. pipeline은 `jsonl`도 읽지만 FastAPI Server는
-  계약상 Parquet만 검증한다.
-- `sha256`은 64자리 hex이며 `sha256:` 접두사를 붙여도 된다.
+FastAPI는 `events.length`를 직접 계산한다. `eventCount`는 중복 정보이므로 완전히 제거했다.
 
-events Parquet은 다음 컬럼을 모두 포함해야 한다. ML pipeline의 `REQUIRED_EVENT_COLUMNS`와
-같은 목록이다.
+`piiRedacted=true`는 Spring의 완료 선언이다. FastAPI는 이 boolean을 강제하지만 질문
+본문에서 주민번호·이메일 등을 자동 탐지하거나 가리는 기능까지 제공하지 않는다.
+
+### 4.4 FastAPI 내부 artifact
+
+Spring이 보낸 camelCase event는 다음 12개 Parquet column으로 변환된다.
 
 ```text
 event_id, request_id, question,
@@ -313,191 +261,307 @@ user_satisfied, escalation_count, created_at,
 router_model_version, pii_redacted
 ```
 
-FastAPI Server는 pipeline을 제출하기 전에 다음을 검증한다.
+- `created_at`: `timestamp[ms, UTC]`
+- `escalation_count`: int32
+- `user_satisfied`, `pii_redacted`: boolean
+- 나머지: UTF-8 string
 
-1. 지원하는 `schemaVersion`인지 확인한다.
-2. `manifestUri`와 `eventsUri`가 허용된 GCS 위치이며 객체가 존재하는지 확인한다.
-3. manifest가 위 필드를 모두 갖추고 timestamp와 window 순서가 유효한지 확인한다.
-4. request와 manifest의 batch ID, schema version, event count와 data URI가 일치하는지
-   확인한다.
-5. `data_format`이 FastAPI Server가 읽을 수 있는 형식인지 확인한다.
-6. manifest의 SHA-256과 실제 events 객체 checksum이 일치하는지 확인한다.
-7. events Parquet이 필수 컬럼을 모두 갖추었는지 확인한다.
-8. Parquet 행 수가 `eventCount`와 일치하는지 확인한다.
-9. 같은 `batchId`로 저장된 기존 요청이 있는지 확인한다.
-10. 다른 batch의 재학습 pipeline이 실행 중인지 확인한다.
+FastAPI는 event를 `eventId`로 정렬해 같은 내용의 재시도에서 동일한 Parquet bytes와 SHA-256을
+만든다. 생성된 artifact schema는 HTTP schema와 다른 `feedback-export-v0.1`이다.
 
-검증 원칙은 **pipeline이 거부할 batch는 FastAPI Server가 먼저 거부한다**이다. GPU 시간을
-쓰기 전에, 그리고 Spring이 아직 요청을 손에 들고 있을 때 422로 돌려주는 것이 목적이다.
+내부 저장 형태는 다음과 같다. 정확한 bucket/prefix는 운영 설정이며 Spring 계약이 아니다.
 
-### 6-3. Accepted response
+```text
+<derived-root>/<candidate-version>/feedback/events.parquet
+<derived-root>/<candidate-version>/feedback/manifest.json
+<derived-root>/<candidate-version>/replay/events.parquet
+<derived-root>/<candidate-version>/replay/manifest.json
+```
 
-Status: `202 Accepted`
+FastAPI는 immutable create 조건으로 저장하며, 같은 URI에 다른 bytes가 이미 있으면
+`409 GCS_OBJECT_CONFLICT`로 중단한다.
+
+### 4.5 Accepted response
+
+`202 Accepted`
 
 ```json
 {
+  "schemaVersion": "escalation-acceptance-v1",
   "status": "accepted",
-  "batchId": "feedback-20260812-0001",
-  "pipelineRunId": "retrain-feedback-20260812-0001-a1b2c3"
+  "batchId": "feedback-20260912-0001",
+  "pipelineRunId": "projects/123456789/locations/us-west1/pipelineJobs/retrain-feedback-20260912-0001-a1b2c3",
+  "logicalModelVersion": "2.1",
+  "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+  "trainingMode": "minor_fine_tune",
+  "versionPolicyMode": "successfulHttpRequest",
+  "statusUrl": "/retraining-runs/feedback-20260912-0001"
 }
 ```
 
-`accepted`는 Vertex AI PipelineJob 제출이 완료되어 `pipelineRunId`가 발급되었다는 뜻이다.
-`pipelineRunId`는 Vertex resource name
-(`projects/<num>/locations/us-west1/pipelineJobs/<job-id>`)이다.
-학습, 평가, package, deploy gate 또는 serving 반영의 성공을 의미하지 않는다.
+`202`는 GCS artifact 생성과 Vertex PipelineJob 제출이 성립했다는 뜻이다. 학습, 평가,
+자동 승격 또는 FastAPI hot-swap 성공을 뜻하지 않는다. `pipelineRunId`는 식별자이므로
+Spring이 그 문자열로 HTTP 요청을 보내지 않는다. Spring은 `statusUrl`을 같은 FastAPI
+base URL에 resolve해 상태를 조회한다.
 
-FastAPI Server는 ModernBERT 학습을 직접 실행하지 않는다. 제출된 pipeline이 다음 순서를
-orchestration한다.
+### 4.6 멱등성과 재시도
 
-```text
-feedback 검증
-  -> 기존 training data 병합
-  -> Vertex AI GPU ModernBERT 재학습
-  -> 평가
-  -> package
-  -> deploy gate
-  -> candidate 또는 rejected
-```
-
-### 6-4. 멱등성
-
-`batchId`는 필수 멱등성 키다.
-
-- 동일한 `batchId`와 동일한 요청 내용으로 재시도하면 새 pipeline을 제출하지 않고 기존
-  `pipelineRunId`를 담아 `202 Accepted`를 반환한다.
-- 동일한 `batchId`이지만 `schemaVersion`, URI 또는 `eventCount`가 다르면 기존 batch를
-  덮어쓰지 않고 `409 Conflict`와 `BATCH_ID_CONFLICT`를 반환한다.
-
-canonical request fingerprint는 batch의 정체성을 규정하는 다음 필드만 SHA-256으로 해싱한다.
+`batchId`는 단순 표시 이름이 아니라 멱등성 키다. fingerprint는 다음 값으로 결정한다.
 
 ```text
-batchId, schemaVersion, manifestUri, eventsUri, eventCount
+batchId + schemaVersion + events 전체 내용(eventId 순 정렬)
 ```
 
-**`requestedAt`은 fingerprint에서 제외한다.** batch 정체성과 무관한 metadata이고, timeout
-후 재시도하는 client는 timestamp를 새로 찍는 것이 자연스럽다. 이를 포함하면 멱등성이
-가장 필요한 상황이 오히려 `BATCH_ID_CONFLICT`가 된다. 따라서 Spring은 재시도 시
-`requestedAt`을 그대로 보내도 되고 새로 찍어도 되며, 두 경우 모두 같은 `pipelineRunId`를
-담은 `202 Accepted`를 받는다.
+`requestedAt`과 events 배열 순서는 batch 정체성에서 제외한다.
 
-동시 실행 가능한 재학습 pipeline은 하나다. 다른 `batchId`의 재학습이 이미 진행 중이면
-`409 Conflict`와 `RETRAINING_IN_PROGRESS`를 반환한다. Spring은 GCS batch를 변경하거나
-삭제하지 않고 보존한 뒤 나중에 같은 요청으로 재시도한다.
+- 같은 `batchId` + 같은 events: 새 pipeline 없이 기존 `pipelineRunId`로 `202`
+- 같은 `batchId` + 다른 events: `409 BATCH_ID_CONFLICT`
+- 다른 batch가 학습 중: `409 RETRAINING_IN_PROGRESS`
+- client timeout 또는 `502/503`: 새 ID를 만들지 말고 같은 batch와 events로 재시도
 
-### 6-4-1. 중단된 제출의 lease 회수
+Spring은 전송한 batch payload를 terminal 상태가 될 때까지 다시 만들 수 있어야 한다. 한
+HTTP 호출이 version trigger 1회이므로 network 오류를 이유로 batch를 임의 분할해서 보내면
+안 된다.
 
-FastAPI Server가 lease를 잡은 뒤 pipeline run ID를 기록하기 전에 죽으면(OOM, pod
-eviction, 배포) 실행 중인 pipeline이 없는데도 lease가 남는다. 이 상태를 방치하면 해당
-batch뿐 아니라 모든 batch의 재학습이 영구히 `RETRAINING_IN_PROGRESS`가 된다.
+현재 FastAPI는 한 번에 하나의 retraining pipeline만 허용하며 SQLite에 멱등성과 lease를
+보존한다. 이는 단일 FastAPI replica 전제다. 다중 replica 전에 shared transactional
+database 또는 distributed lease로 교체한다.
 
-다음 `/escalate` 요청이 이런 lease를 자동으로 정리한다. run ID가 없고 마지막 갱신이
-`LLM_ROUTER_RETRAINING_STALE_SUBMISSION_SECONDS`(기본 900초)보다 오래된 lease에 대해:
+### 4.7 즉시 오류
 
-- Vertex에 해당 batch의 결정적 job ID가 존재하면 그 run을 채택하고 `pipelineRunId`로
-  이어서 사용한다. 같은 batch를 두 번 학습하지 않는다.
-- 존재하지 않으면 제출이 성립하지 않은 것으로 보고 lease를 해제한다. 이후 같은 요청을
-  재시도하면 정상 제출된다.
-
-임계 시간은 제출 중인 요청의 lease를 빼앗지 않기 위한 안전 여유다. 제출은 초 단위로
-끝나므로 기본값을 줄일 이유는 없다.
-
-현재 구현은 persistent SQLite lease를 사용하므로 FastAPI 단일 replica를 전제로 한다.
-여러 replica로 확장하기 전에는 shared transactional database 또는 distributed lease로
-교체해 동시 실행 제한이 전체 replica에 걸쳐 유지되게 해야 한다.
-
-### 6-5. 오류
-
-| Status | Code | 조건 |
+| HTTP | `code` | Spring 처리 |
 | --- | --- | --- |
-| `401 Unauthorized` | `UNAUTHORIZED` | 내부 인증 실패 |
-| `403 Forbidden` | `FORBIDDEN` | pipeline 제출 또는 GCS 접근 권한 없음 |
-| `409 Conflict` | `BATCH_ID_CONFLICT` | 같은 `batchId`에 다른 요청 내용이 존재 |
-| `409 Conflict` | `RETRAINING_IN_PROGRESS` | 다른 batch의 pipeline이 이미 실행 중 |
-| `422 Unprocessable Entity` | `UNSUPPORTED_SCHEMA_VERSION` | 지원하지 않는 `schemaVersion` |
-| `422 Unprocessable Entity` | `GCS_OBJECT_NOT_FOUND` | manifest 또는 events 객체가 없음 |
-| `422 Unprocessable Entity` | `MANIFEST_MISMATCH` | manifest 필수 필드 누락·형식 오류, window 순서 오류, 또는 request와 manifest metadata 불일치 |
-| `422 Unprocessable Entity` | `UNSUPPORTED_DATA_FORMAT` | `data_format`이 `parquet`이 아님 |
-| `422 Unprocessable Entity` | `CHECKSUM_MISMATCH` | events 객체 checksum 불일치 |
-| `422 Unprocessable Entity` | `EVENT_SCHEMA_MISMATCH` | events Parquet에 필수 컬럼 누락 |
-| `422 Unprocessable Entity` | `EVENT_COUNT_MISMATCH` | request, manifest 또는 Parquet 행 수 불일치 |
-| `422 Unprocessable Entity` | `REQUEST_VALIDATION_FAILED` | request body가 schema를 위반 (`eventCount != 1000` 포함) |
-| `503 Service Unavailable` | `GCS_BACKEND_UNAVAILABLE` | GCS API에 연결할 수 없음 |
-| `502 Bad Gateway` | `PIPELINE_SUBMISSION_FAILED` | Vertex AI가 제출을 거부하거나 유효한 run ID를 반환하지 못함 |
-| `503 Service Unavailable` | `PIPELINE_BACKEND_UNAVAILABLE` | Vertex AI backend에 연결할 수 없음 |
+| 401 | `UNAUTHORIZED` | token 설정 확인; 자동 무한 재시도 금지 |
+| 403 | `FORBIDDEN` | FastAPI의 Vertex/GCS IAM 장애로 운영 알림 |
+| 409 | `BATCH_ID_CONFLICT` | 재시도 금지; 같은 ID에 다른 payload가 저장됐는지 조사 |
+| 409 | `RETRAINING_IN_PROGRESS` | 같은 payload를 보존하고 backoff 후 재시도 |
+| 409 | `GCS_OBJECT_CONFLICT` | 운영 조사; immutable path에 다른 내용 존재 |
+| 422 | `UNSUPPORTED_SCHEMA_VERSION` | client/server 배포 version 확인 |
+| 422 | `REQUEST_VALIDATION_FAILED` | DTO, 필드, UTC, label, boolean, 중복 ID 수정 |
+| 502 | `PIPELINE_SUBMISSION_FAILED` | 같은 batch/payload로 제한 재시도 후 알림 |
+| 503 | `GCS_BACKEND_UNAVAILABLE` | 같은 batch/payload로 backoff 재시도 |
+| 503 | `PIPELINE_BACKEND_UNAVAILABLE` | 같은 batch/payload로 backoff 재시도 |
 
-오류 예시:
+## 5. 재학습 version 정책
+
+기본 연구 mode는 승격까지 성공한 HTTP 요청 수를 기준으로 한다.
+
+```text
+n.0 anchor
+  -> 첫 성공 호출: n.1, minor_fine_tune
+  -> 둘째 성공 호출: n.2, minor_fine_tune
+  -> 셋째 성공 호출: (n+1).0, major_consolidation
+```
+
+minor 두 번과 major 한 번은 같은 `.0` anchor에서 시작하며, major는 그 cycle의 세 호출
+feedback을 합친다. 이전 cycle 전체를 무한 누적하지 않고 label별 최대 32행 compact replay를
+유지한다. major consolidation 5회마다 `pristine_rebase`를 실행해 순정 ModernBERT + 기본
+RouterBench + compact replay로 재기준화한다.
+
+호출이 접수만 되고 학습이 실패한 경우 성공 횟수에 포함하지 않는다. 같은 batch의 멱등
+재시도도 횟수를 늘리지 않는다.
+
+## 6. `GET /retraining-runs/{batchId}`
+
+Spring은 이 endpoint 하나로 학습 결과와 serving 반영 여부를 조회한다. Vertex 또는 GCS를
+직접 조회하지 않는다.
+
+```http
+GET /retraining-runs/feedback-20260912-0001
+Authorization: Bearer <internal-token>
+X-Request-ID: req-retrain-status-1
+```
+
+핵심 response schema:
 
 ```json
 {
-  "error": "다른 재학습 작업이 진행 중입니다.",
-  "code": "RETRAINING_IN_PROGRESS",
-  "requestId": "req-retrain-123"
+  "schemaVersion": "retraining-status-v1",
+  "batchId": "feedback-20260912-0001",
+  "pipelineRunId": "projects/123456789/locations/us-west1/pipelineJobs/retrain-feedback-20260912-0001-a1b2c3",
+  "status": "running",
+  "terminal": false,
+  "stage": "training",
+  "version": {
+    "logicalModelVersion": "2.1",
+    "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+    "trainingMode": "minor_fine_tune",
+    "initializationMode": "approved_anchor",
+    "versionPolicyMode": "successfulHttpRequest"
+  },
+  "stageProgress": {
+    "current": 612,
+    "total": 7038,
+    "unit": "optimizerStep",
+    "percent": 8.7,
+    "epoch": 1,
+    "totalEpochs": 3,
+    "heartbeatAt": "2026-09-12T07:12:30Z"
+  },
+  "result": null,
+  "activation": {
+    "status": "pending",
+    "desiredModelVersion": null,
+    "servingModelVersion": "router-modernbert-base-routerbench-20260814-45dcc6d",
+    "checkedAt": "2026-09-12T07:12:32Z"
+  },
+  "submittedAt": "2026-09-12T06:30:02Z",
+  "startedAt": "2026-09-12T06:30:45Z",
+  "endedAt": null,
+  "lastUpdatedAt": "2026-09-12T07:12:32Z",
+  "stale": false,
+  "warnings": []
 }
 ```
 
-### 6-6. 추적과 감사
-
-Spring과 FastAPI는 다음 값을 양쪽 로그에서 연결할 수 있어야 한다.
-
-- `requestId`
-- `batchId`
-- `pipelineRunId`
-- pipeline 제출 시각과 제출 주체
-- manifest/events URI와 checksum
-- pipeline 최종 상태 및 candidate/rejected model version
-
-GCS batch는 pipeline 완료 전후에 덮어쓰지 않는다. 보존·삭제 기간은 별도 data retention
-정책으로 정한다.
-
-## 7. 상태 추적 API 후속 계약
-
-`POST /escalate`가 비동기 제출 API이므로 Spring이 `pipelineRunId`로 실행 상태를 조회할
-방법이 필요하다. 상태 조회 endpoint의 path, polling 간격, 상태 enum과 terminal state는
-후속 계약에서 확정한다. 확정 전에도 `pipelineRunId`는 `/escalate` 성공 응답과 양쪽 로그에
-반드시 남긴다.
-
-후보 endpoint:
+`status` enum:
 
 ```text
-GET /pipelines/{pipelineRunId}
+queued | running | cancelling | paused |
+succeeded | rejected | failed | cancelled | unknown
 ```
 
-후보 상태:
+`terminal=true`인 값은 `succeeded`, `rejected`, `failed`, `cancelled`다. terminal 실패도 조회
+자체는 정상 처리이므로 HTTP 200으로 반환한다.
+
+`stage` enum:
 
 ```text
-queued | validating | training | evaluating | packaging
-candidate | rejected | failed | cancelled
+initializing | feedbackPreparation | feedbackMerge | training |
+evaluation | packaging | gate | publishing | complete
 ```
 
-## 8. Contract test 최소 범위
+terminal `result`의 핵심 필드:
 
-- `/router/embed`가 정확히 1,024개의 유한 실수를 반환하고 vector norm이 허용 오차 안에서
-  `1.0`인지 검사한다.
-- EXP-003 고정 질문 fixture의 embedding과 serving 결과가 허용 오차 안에서 같은지
-  검사한다.
-- `/router/classify`가 항상 유효한 tier, confidence와 `modelVersion`을 반환하는지 검사한다.
-- checkpoint의 `easy=0`, `medium=1`, `hard=2` 순서가 API tier와 일치하는지 검사한다.
-- model loading 중 `/health`가 `503`, 모두 loaded일 때 `200`인지 검사한다.
-- `/escalate`의 정상 제출, 같은 요청 재시도, batch ID 충돌, 동시 실행 충돌을 검사한다.
-- `requestedAt`만 다른 재시도가 같은 `pipelineRunId`로 `202`를 받는지 검사한다.
-- manifest metadata, checksum, GCS 객체 존재, 필수 컬럼과 행 수 오류가 각각 구분되는
-  `422` code로 반환되는지 검사한다.
-- manifest 필수 필드 목록과 events 필수 컬럼 목록이 ML pipeline의
-  `REQUIRED_MANIFEST_FIELDS`, `REQUIRED_EVENT_COLUMNS`와 일치하는지 검사한다.
-- 중단된 제출이 남긴 lease가 Vertex 조회로 채택 또는 해제되는지 검사한다.
-- Spring과 FastAPI fixture를 같은 저장본에서 검증해 필드명과 enum drift를 차단한다.
+```json
+{
+  "outcome": "promoted",
+  "candidateModelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+  "logicalModelVersion": "2.1",
+  "gatePassed": true,
+  "failedGateChecks": [],
+  "failureCode": null,
+  "failureStage": null,
+  "retryable": false,
+  "message": null,
+  "approvedAt": "2026-09-12T09:42:10Z"
+}
+```
 
-## 9. 확정이 필요한 항목
+`outcome`: `promoted | rejected | failed | cancelled`
 
-- 운영 내부 인증을 bearer token보다 강한 workload identity/mTLS로 교체할지 여부
-- `/health` probe의 network policy
-- embedding과 classify의 최대 입력 길이, timeout, retry와 concurrency
-- EXP-003가 동일한 고정 revision과 preprocessing 계약을 사용하는지 여부
-- health 응답에 실제 model version을 포함할지 여부
-- 멱등성 record 보존 기간 (fingerprint 구성은 §6-4에서 확정)
-- pipeline 상태 조회 endpoint와 상태 enum
-- `candidate_model_version`에 batch 식별자를 포함해 같은 날 두 번째 재학습이 첫 candidate
-  package를 덮어쓰지 않게 할 방법
-- GCS 버킷 allowlist 위반과 서버측 IAM 거부를 다른 code로 분리할지 여부
-- GCS URI allowlist, IAM principal과 data retention 기간
+안정된 `failureCode`:
+
+```text
+FEEDBACK_VALIDATION_FAILED | NO_UNIQUE_FEEDBACK |
+TRAINING_FAILED | EVALUATION_FAILED | DEPLOY_GATE_REJECTED |
+PACKAGE_FAILED | PUBLISH_FAILED | PIPELINE_CANCELLED |
+UNKNOWN_PIPELINE_FAILURE
+```
+
+`activation.status`:
+
+| 값 | 의미 |
+| --- | --- |
+| `pending` | 승격 전이거나 watcher가 새 package를 적재 중 |
+| `active` | 이 FastAPI process가 candidate version으로 실제 추론 중 |
+| `loadFailed` | 새 package 적재 실패; 직전 known-good model을 계속 사용 |
+| `superseded` | 이 run 이후 더 최신 model이 이미 serving 중 |
+| `notApplicable` | 거부·실패·취소로 반영 대상이 아님 |
+
+조회 시 Vertex/GCS가 일시적으로 실패해도 저장 snapshot이 있으면 HTTP 200,
+`stale=true`, `warnings=["PIPELINE_STATUS_STALE"]`를 반환한다. snapshot도 없으면
+`503 PIPELINE_STATUS_UNAVAILABLE`, batch가 없으면 `404 RETRAINING_RUN_NOT_FOUND`다.
+
+## 7. `GET /router/model/current`
+
+승인 포인터가 원하는 model과 이 process가 실제 추론에 쓰는 model을 함께 반환한다.
+
+```json
+{
+  "schemaVersion": "router-model-status-v1",
+  "status": "inSync",
+  "source": "currentPointer",
+  "desired": {
+    "modelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+    "logicalModelVersion": "2.1",
+    "trainingMode": "minor_fine_tune",
+    "manifestSha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "approvedAt": "2026-09-12T09:42:10Z"
+  },
+  "serving": {
+    "modelVersion": "router-modernbert-feedback-v2.1-20260912-a1b2c3d4-45dcc6d",
+    "logicalModelVersion": "2.1",
+    "loadedAt": "2026-09-12T09:43:01Z"
+  },
+  "previousKnownGood": {
+    "modelVersion": "router-modernbert-feedback-v2.0-20260901-b1c2d3e4-45dcc6d"
+  },
+  "lastPointerCheckAt": "2026-09-12T09:43:01Z",
+  "lastSuccessfulSwapAt": "2026-09-12T09:43:01Z",
+  "lastLoadError": null
+}
+```
+
+`status`: `inSync | loading | loadFailed | static | unavailable`
+
+`succeeded` pipeline과 `activation=active`는 다르다. pipeline 성공은 package 게시와
+`CURRENT.json` 변경까지이고, `active`는 FastAPI가 package checksum/label 계약을 검증하고
+메모리 model swap까지 끝냈다는 뜻이다.
+
+## 8. 개발자 version policy API
+
+이 API는 Spring 연동 대상이 아니다. 별도 developer token, feature flag와 network 제한을
+사용한다.
+
+```http
+GET /developer/retraining/version-policy
+PUT /developer/retraining/version-policy
+```
+
+허용 mode:
+
+- `successfulHttpRequest`: 승격까지 성공한 고유 HTTP batch 3회 기준. 현재 연구 기본값.
+- `validatedUniqueBatch`: canonical 검증을 통과하고 이전과 다른 digest가 생긴 batch 3회 기준.
+
+PUT request 초안:
+
+```json
+{
+  "mode": "validatedUniqueBatch",
+  "reason": "production trigger validation completed"
+}
+```
+
+mode 변경은 이미 제출된 run을 재해석하거나 version counter를 초기화하지 않는다. 변경 이력은
+행위자, 시각, 이전/신규 mode, 사유와 함께 감사 로그에 남긴다.
+
+## 9. Spring polling 규칙
+
+Spring의 기본 polling 규칙은 다음과 같다.
+
+1. `202`를 받으면 10초 뒤 첫 조회를 한다.
+2. `terminal=false`면 15초, 30초, 이후 최대 60초 간격으로 backoff한다.
+3. `stale=true` 또는 `status=unknown`은 완료로 확정하지 않는다.
+4. `terminal=true`면 polling을 끝낸다.
+5. `status=succeeded`여도 `activation.status=active`가 아니면 model 반영 대기 상태로 둔다.
+6. `/retraining-runs/{batchId}`의 `statusUrl`만 HTTP로 호출한다. `pipelineRunId`와 GCS URI는
+   호출 URL이 아니다.
+
+## 10. Contract test 조건
+
+최소한 다음을 Spring과 FastAPI 양쪽 contract test로 고정한다.
+
+- 1개 event가 포함된 `feedback-inline-v1` 요청이 202가 된다.
+- 빈 `events`와 `eventCount`, `manifestUri`, `eventsUri`가 포함된 요청은 422가 된다.
+- 같은 event를 다른 배열 순서와 다른 `requestedAt`으로 재시도해도 같은 run ID가 나온다.
+- 같은 `batchId`에 다른 event 내용은 409가 된다.
+- label 하향, `userSatisfied=false`, `piiRedacted=false`, 중복 event ID, non-UTC 시각은 422다.
+- Parquet 12개 column/type과 manifest SHA-256이 ML validator 계약과 일치한다.
+- 202 이후 running, terminal failure, promoted, activation active 상태를 구분한다.
+- 새 model load 실패 시 현재 known-good model이 계속 `/router/classify`를 처리한다.
+
+복사 가능한 request fixture는
+[`examples/escalation-feedback-inline-v1/escalate-request.example.json`](examples/escalation-feedback-inline-v1/escalate-request.example.json)에 있다.
+조회 response fixture는 [`examples/retraining-api-v1/`](examples/retraining-api-v1/)에
+있다.
