@@ -80,6 +80,7 @@ Spring은 error 문자열이 아니라 code로 분기한다.
 | Method/path | 용도 | 정상 HTTP |
 | --- | --- | ---: |
 | POST /router/embed | 질문 embedding | 200 |
+| POST /router/rerank | pgvector 후보의 선택적 정밀 점수 | 200 |
 | POST /router/classify | 질문 난이도 분류 | 200 |
 | GET /health | embedding/router readiness | 200 또는 503 |
 | POST /escalate | inline feedback 접수·재학습 제출 | 202 |
@@ -109,12 +110,14 @@ Ready:
 {
   "status": "ok",
   "embedModel": "loaded",
-  "routerModel": "loaded"
+  "routerModel": "loaded",
+  "rerankModel": "disabled"
 }
 ~~~
 
-두 model 중 하나라도 준비되지 않으면 HTTP 503과 status=not_ready를 반환한다. /health는
-model version 조회용이 아니다.
+BGE와 router 중 하나라도 준비되지 않으면 HTTP 503과 status=not_ready를 반환한다.
+rerankModel은 disabled | loading | loaded | error이며 선택 계층이므로 readiness를 막지
+않는다. /health는 model version 조회용이 아니다.
 
 ### 4.2 POST /router/embed
 
@@ -143,7 +146,37 @@ Response:
 
 다른 embedding modelVersion의 vector를 같은 cache 공간에서 비교하지 않는다.
 
-### 4.3 POST /router/classify
+### 4.3 POST /router/rerank
+
+Spring이 pgvector에서 찾은 후보를 query와 함께 보낸다. 후보 검색, threshold와 최종
+cache hit/miss 판정은 계속 Spring이 소유한다.
+
+~~~json
+{
+  "query": "How does photosynthesis work?",
+  "candidates": [
+    "Why do plants need sunlight?",
+    "How do plants convert light into chemical energy?"
+  ]
+}
+~~~
+
+Response:
+
+~~~json
+{
+  "scores": [0.013, 0.941],
+  "modelVersion": "cross-encoder/quora-distilroberta-base@f62e7a4"
+}
+~~~
+
+- scores[i]는 candidates[i]에 대응하며 FastAPI가 정렬하지 않는다.
+- 배포 기본 후보 상한은 16개다.
+- threshold는 modelVersion별로 관리한다. BGE cosine threshold와 혼용하지 않는다.
+- 503 RERANK_MODEL_NOT_READY, 추론 오류 또는 비유한 점수는 cache miss로 처리한다.
+- 리랭커는 기본 비활성이며 별도 운영 승인 후에만 환경변수로 켠다.
+
+### 4.4 POST /router/classify
 
 Request:
 
@@ -503,6 +536,7 @@ response의 version을 그대로 저장한다.
 
 - [ ] FastAPI base URL과 internal token을 환경 설정으로 분리했다.
 - [ ] OpenAPI 파일로 DTO/client 또는 contract test를 생성했다.
+- [ ] reranker 비활성·503·오류를 cache miss로 처리하고 modelVersion별 threshold를 관리한다.
 - [ ] top-level 4필드와 event 12필드를 정확히 구현했다.
 - [ ] eventCount, manifestUri, eventsUri가 없다.
 - [ ] question의 실제 PII 제거 후에만 piiRedacted=true를 설정한다.

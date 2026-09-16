@@ -11,7 +11,7 @@ A version pin would only express the hope that the two agree. This checks it:
 if the scores drift, the threshold is no longer valid and the run fails.
 
     python scripts/verify_reranker_parity.py \
-        --csv ../LLM_Router/experiments/results/reranker-20260830/quora-distilroberta/cross-encoder--quora-distilroberta-base.csv \
+        --csv /path/to/cross-encoder--quora-distilroberta-base.csv \
         --model /opt/models/quora-distilroberta-base
 """
 
@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from llm_router_serving.inference import TransformersCrossEncoderReranker  # noqa: E402
+from llm_router_serving.inference import TransformersCrossEncoderReranker
 
 
 def main() -> int:
@@ -68,15 +68,19 @@ def main() -> int:
 
         if delta > args.tolerance:
             numeric_failures += 1
-            print(f"수치 불일치 {row['pair_id']}: "
-                  f"기대 {expected:.8f} 실제 {actual:.8f} 차이 {delta:.2e}")
+            print(
+                f"수치 불일치 {row['pair_id']}: "
+                f"기대 {expected:.8f} 실제 {actual:.8f} 차이 {delta:.2e}"
+            )
 
         # This is what the cache actually depends on. A score can drift by float32
         # noise without consequence; a pair changing side of the threshold cannot.
         if (expected >= args.threshold) != (actual >= args.threshold):
             decision_flips += 1
-            print(f"판정 뒤집힘 {row['pair_id']}: "
-                  f"기대 {expected:.8f} 실제 {actual:.8f} (임계값 {args.threshold})")
+            print(
+                f"판정 뒤집힘 {row['pair_id']}: "
+                f"기대 {expected:.8f} 실제 {actual:.8f} (임계값 {args.threshold})"
+            )
 
     print(f"\n{len(rows)}쌍 검증")
     print(f"  최대 점수 차이 : {worst:.2e}  (허용 {args.tolerance:.0e})")

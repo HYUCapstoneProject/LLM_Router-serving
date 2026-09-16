@@ -577,9 +577,7 @@ class EscalationService:
                 if (
                     name is RetrainingStageName.FEEDBACK_PREPARATION
                     and artifact.get("failure_code") == "NO_UNIQUE_FEEDBACK"
-                ) or (
-                    name is RetrainingStageName.GATE and artifact.get("passed") is False
-                ):
+                ) or (name is RetrainingStageName.GATE and artifact.get("passed") is False):
                     state = StageExecutionStatus.FAILED
                     terminal_failure_seen = True
             elif name is RetrainingStageName.TRAINING and observed.training_progress:
@@ -655,9 +653,7 @@ class EscalationService:
             logicalModelVersion=job.logical_model_version or "0.0",
             gatePassed=False if outcome is RetrainingOutcome.REJECTED else None,
             failedGateChecks=[
-                str(check.get("name", "unknown"))
-                if isinstance(check, dict)
-                else str(check)
+                str(check.get("name", "unknown")) if isinstance(check, dict) else str(check)
                 for check in (observed.gate or {}).get("failed_checks", [])
             ],
             failureCode=code,

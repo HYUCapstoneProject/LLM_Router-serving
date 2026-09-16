@@ -6,13 +6,14 @@
 
 ## 1. 목적
 
-`LLM_Router-serving`은 Spring Gateway와 ML 시스템 사이에서 다음 세 가지 역할을 맡는
+`LLM_Router-serving`은 Spring Gateway와 ML 시스템 사이에서 다음 네 가지 역할을 맡는
 FastAPI 서비스다.
 
 1. 질문을 BGE 계열 모델로 임베딩한다.
-2. 캐시 미스 질문을 현재 ModernBERT router로 분류해 `easy`, `medium`, `hard` 중 하나를
+2. Spring이 pgvector에서 찾은 cache 후보를 선택적 cross-encoder로 정밀 재채점한다.
+3. 캐시 미스 질문을 현재 ModernBERT router로 분류해 `easy`, `medium`, `hard` 중 하나를
    반환한다. 향후 backbone 교체 뒤에도 이 HTTP 출력 계약은 유지한다.
-3. Spring이 HTTP로 보낸 escalation feedback event를 검증·artifact화해 기존 Vertex AI
+4. Spring이 HTTP로 보낸 escalation feedback event를 검증·artifact화해 기존 Vertex AI
    Pipelines 재학습 파이프라인에 연결하고, gate를 통과한 새 모델을 이후 라우팅 추론에
    반영한다.
 
@@ -37,7 +38,10 @@ Parquet/manifest/checksum/replay/GCS 변경은 이 경계 안에서만 일어난
   -> Spring Gateway
        -> FastAPI: BGE embedding 요청
        <- 정규화된 embedding + embedding model version
-       -> Spring: pgvector 캐시 유사도 검사
+       -> Spring: pgvector에서 cache 후보 검색
+            -> FastAPI: 선택적으로 query + 후보 목록 재채점
+            <- 순서가 보존된 cross-encoder scores + reranker model version
+            -> Spring: model-version별 threshold로 cache hit 판정
             -> cache hit: 저장된 응답 반환
             -> cache miss
                  -> FastAPI: ModernBERT 난이도 분류 요청
@@ -46,8 +50,9 @@ Parquet/manifest/checksum/replay/GCS 변경은 이 경계 안에서만 일어난
                  -> LLM 호출, 로그 기록, 캐시 저장
 ```
 
-FastAPI는 embedding과 난이도 분류만 담당한다. pgvector 조회, cache threshold,
-캐시 hit/miss 판정, 실제 LLM model ID 선택과 LLM 호출은 Spring의 책임이다.
+FastAPI는 embedding, 선택적 후보 재채점과 난이도 분류를 담당한다. pgvector 조회,
+reranker model-version별 cache threshold, 캐시 hit/miss 판정, 실제 LLM model ID 선택과
+LLM 호출은 Spring의 책임이다.
 
 ### 2-2. Feedback 재학습
 
@@ -75,8 +80,8 @@ FastAPI는 별도의 학습 loop를 구현하지 않는다. 재학습은 `LLM_Ro
 
 | 컴포넌트 | 책임 | 책임이 아닌 것 |
 | --- | --- | --- |
-| Spring Gateway | 공개 chat API, cache 조회·정책, 실제 LLM 선택·호출, escalation 수집·PII 제거·batch trigger·inline 전송 | GCS/Parquet/manifest, embedding·ModernBERT 추론, ML 학습 loop |
-| FastAPI serving | BGE inference, ModernBERT inference, 모델 version 노출, inline feedback 검증·artifact화·pipeline 제출, 승인 모델 반영 | pgvector 직접 조회, cache 판정, 실제 LLM 호출, Spring DB 직접 조회 |
+| Spring Gateway | 공개 chat API, cache 후보 조회·threshold·hit/miss 정책, 실제 LLM 선택·호출, escalation 수집·PII 제거·batch trigger·inline 전송 | GCS/Parquet/manifest, embedding·cross-encoder·ModernBERT 추론, ML 학습 loop |
+| FastAPI serving | BGE inference, 선택적 cross-encoder 후보 점수, ModernBERT inference, 모델 version 노출, inline feedback 검증·artifact화·pipeline 제출, 승인 모델 반영 | pgvector 직접 조회, cache 판정, 실제 LLM 호출, Spring DB 직접 조회 |
 | Vertex AI Pipelines | feedback 검증·병합, 학습 orchestration, 평가, package, deploy gate와 lineage | 온라인 요청 처리, Spring DB 직접 조회, 현재 serving process 직접 변경 |
 | Vertex AI Custom Training | ModernBERT GPU 재학습 | pipeline 전체 orchestration, serving traffic 전환 |
 | GCS/Artifact Registry | versioned dataset·model·metric과 immutable image 보관 | 승인 정책 결정 |
@@ -101,7 +106,23 @@ endpoint는 `POST /router/embed`다. cache 조회 전에 항상 호출하며, pa
 normalization, 질문 간 대칭 비교에서 prefix 미사용이다. embedding version이 달라지면
 기존 cache vector와 섞지 않는다.
 
-### 4-2. 3단계 router 분류
+### 4-2. 선택적 cache reranker
+
+endpoint는 `POST /router/rerank`다. Spring이 pgvector에서 찾은 query와 후보 목록을 보내면
+FastAPI는 입력 순서와 같은 순서로 cross-encoder 점수와 `modelVersion`을 반환한다.
+FastAPI는 후보를 정렬하거나 hit/miss를 결정하지 않는다.
+
+현재 이미지는 `cross-encoder/quora-distilroberta-base`의 고정 revision을 포함하지만,
+false-hit gate를 통과한 운영 승인이 없으므로 기본 비활성이다. 배포가
+`LLM_ROUTER_RERANK_MODEL_ID=/opt/models/quora-distilroberta-base`를 명시한 경우에만
+로딩한다. 비활성·미로딩 상태의 503, 추론 오류 또는 비유한 점수는 Spring에서 cache
+miss로 처리한다. 리랭커 상태는 `/health.rerankModel`에 노출하지만 BGE/Router readiness를
+막지 않는다.
+
+threshold는 점수 scale과 checkpoint에 종속되므로 Spring은 반드시 `modelVersion`과 함께
+관리한다. 서로 다른 version의 점수나 BGE cosine threshold를 혼용하지 않는다.
+
+### 4-3. 3단계 router 분류
 
 endpoint는 `POST /router/classify`다. 현재 적재 모델은 ModernBERT이며 cache miss일 때만
 호출한다. payload의 단일 기준은

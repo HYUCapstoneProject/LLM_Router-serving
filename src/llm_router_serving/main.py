@@ -84,9 +84,7 @@ developer_bearer = HTTPBearer(auto_error=False, scheme_name="developerBearer")
 
 async def require_internal_auth(
     request: Request,
-    credential: Annotated[
-        HTTPAuthorizationCredentials | None, Security(internal_bearer)
-    ],
+    credential: Annotated[HTTPAuthorizationCredentials | None, Security(internal_bearer)],
 ) -> None:
     settings: Settings = request.app.state.settings
     expected_secret = settings.internal_api_token
@@ -103,9 +101,7 @@ InternalAuth = Annotated[None, Depends(require_internal_auth)]
 
 async def require_developer_auth(
     request: Request,
-    credential: Annotated[
-        HTTPAuthorizationCredentials | None, Security(developer_bearer)
-    ],
+    credential: Annotated[HTTPAuthorizationCredentials | None, Security(developer_bearer)],
 ) -> None:
     settings: Settings = request.app.state.settings
     if not settings.enable_developer_api or settings.developer_api_token is None:
@@ -661,9 +657,7 @@ def create_app(
             503: {"model": ErrorResponse},
         },
     )
-    async def retraining_status(
-        batchId: str, _: InternalAuth
-    ) -> RetrainingStatusResponse:
+    async def retraining_status(batchId: str, _: InternalAuth) -> RetrainingStatusResponse:
         service = app.state.escalation_service
         if service is None:
             raise ApiError(
@@ -698,9 +692,7 @@ def create_app(
         response_model=CurrentModelResponse,
         responses={401: {"model": ErrorResponse}, 503: {"model": CurrentModelResponse}},
     )
-    async def current_router_model(
-        response: Response, _: InternalAuth
-    ) -> CurrentModelResponse:
+    async def current_router_model(response: Response, _: InternalAuth) -> CurrentModelResponse:
         result = _current_model_response(
             settings,
             model_manager,

@@ -45,9 +45,7 @@ def test_returns_503_when_reranker_is_not_configured(client, auth_headers):
 
 
 def test_requires_authentication(rerank_client):
-    response = rerank_client.post(
-        "/router/rerank", json={"query": "q", "candidates": ["c"]}
-    )
+    response = rerank_client.post("/router/rerank", json={"query": "q", "candidates": ["c"]})
     assert response.status_code == 401
 
 

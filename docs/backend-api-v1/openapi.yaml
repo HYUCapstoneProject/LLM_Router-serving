@@ -23,7 +23,7 @@ paths:
     get:
       tags: [Health]
       operationId: getHealth
-      summary: Check embedding and router model readiness
+      summary: Check embedding/router readiness and optional reranker status
       responses:
         "200":
           description: Both models are ready
@@ -38,6 +38,7 @@ paths:
                 status: ok
                 embedModel: loaded
                 routerModel: loaded
+                rerankModel: disabled
         "503":
           description: At least one model is not ready
           headers:
@@ -51,6 +52,7 @@ paths:
                 status: not_ready
                 embedModel: loaded
                 routerModel: loading
+                rerankModel: loaded
   /router/embed:
     post:
       tags: [Routing]
@@ -78,6 +80,51 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/EmbedResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /router/rerank:
+    post:
+      tags: [Routing]
+      operationId: rerankCandidates
+      summary: Score Spring's pgvector candidates with the optional cross-encoder
+      description: |
+        Scores are positionally aligned with candidates. Spring owns candidate
+        lookup, the model-version-specific threshold, and the final cache hit/miss
+        decision. A disabled or unavailable reranker must be treated as a cache miss.
+      security:
+        - internalBearer: []
+      parameters:
+        - $ref: "#/components/parameters/XRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RerankRequest"
+            example:
+              query: How does photosynthesis work?
+              candidates:
+                - Why do plants need sunlight?
+                - How do plants convert light into chemical energy?
+      responses:
+        "200":
+          description: Candidate scores in request order
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RerankResponse"
+              example:
+                scores: [0.013, 0.941]
+                modelVersion: cross-encoder/quora-distilroberta-base@f62e7a4
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -461,6 +508,40 @@ components:
         modelVersion:
           type: string
           minLength: 1
+    RerankRequest:
+      type: object
+      additionalProperties: false
+      required: [query, candidates]
+      properties:
+        query:
+          type: string
+          minLength: 1
+          description: Non-blank user question
+        candidates:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: string
+            minLength: 1
+          description: pgvector candidates in the order Spring expects scores
+    RerankResponse:
+      type: object
+      additionalProperties: false
+      required: [scores, modelVersion]
+      properties:
+        scores:
+          type: array
+          minItems: 1
+          maxItems: 16
+          items:
+            type: number
+            format: float
+          description: scores[i] corresponds to candidates[i]
+        modelVersion:
+          type: string
+          minLength: 1
+          description: Thresholds must be keyed by this immutable model version
     ClassifyResponse:
       type: object
       additionalProperties: false
@@ -480,10 +561,13 @@ components:
     ModelLoadStatus:
       type: string
       enum: [loaded, loading, error]
+    ModelLoadStatusOrDisabled:
+      type: string
+      enum: [loaded, loading, error, disabled]
     HealthResponse:
       type: object
       additionalProperties: false
-      required: [status, embedModel, routerModel]
+      required: [status, embedModel, routerModel, rerankModel]
       properties:
         status:
           type: string
@@ -492,6 +576,9 @@ components:
           $ref: "#/components/schemas/ModelLoadStatus"
         routerModel:
           $ref: "#/components/schemas/ModelLoadStatus"
+        rerankModel:
+          $ref: "#/components/schemas/ModelLoadStatusOrDisabled"
+          description: Optional and excluded from overall readiness
     EscalationEvent:
       type: object
       additionalProperties: false

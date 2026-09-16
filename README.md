@@ -1,22 +1,24 @@
 # LLM_Router-serving
 
-FastAPI server for ML routing, embedding, and feedback-retraining orchestration. The current
-production-compatible classifier is ModernBERT; the HTTP contract itself is router-backbone neutral.
+FastAPI server for ML routing, embedding, optional cache reranking, and feedback-retraining
+orchestration. The current production-compatible classifier is ModernBERT; the HTTP contract itself
+is router-backbone neutral.
 
 ## Implemented API
 
 | Method | Path | Behavior |
 | --- | --- | --- |
 | `POST` | `/router/embed` | CLS-pooled, L2-normalized 1,024-dimensional BGE embedding |
+| `POST` | `/router/rerank` | Optional cross-encoder scores for Spring's pgvector candidates |
 | `POST` | `/router/classify` | Active router's `easy`/`medium`/`hard` classification |
-| `GET` | `/health` | BGE and router loading/readiness state |
+| `GET` | `/health` | BGE/router readiness plus optional reranker state |
 | `POST` | `/escalate` | Validates inline feedback, materializes GCS artifacts, and submits Vertex retraining |
 | `GET` | `/retraining-runs/{batchId}` | Retraining stage, result, and model-activation status |
 | `GET` | `/router/model/current` | Desired, serving, and previous known-good model status |
 | `GET/PUT` | `/developer/retraining/version-policy` | Developer-only version trigger policy |
 
-The server does not query pgvector or select the actual LLM. Spring owns cache lookup and the
-tier-to-model mapping.
+The server does not query pgvector, own the cache threshold, or select the actual LLM. Spring owns
+candidate lookup, cache hit/miss, and the tier-to-model mapping.
 
 ## Local setup
 
@@ -39,9 +41,18 @@ GCP instance does not depend on Hugging Face availability during startup.
 .venv/bin/uvicorn llm_router_serving.main:app --host 0.0.0.0 --port 8000
 ```
 
-Model loading runs in the background. `/health` returns `503` until both models are loaded and
-returns `200` afterward. Interactive OpenAPI documentation is available at `/docs` in environments
-where that route is exposed.
+Model loading runs in the background. `/health` returns `503` until BGE and the router are loaded and
+returns `200` afterward. The optional reranker is reported as `disabled`, `loading`, `loaded`, or
+`error`, but never gates readiness. Interactive OpenAPI documentation is available at `/docs` in
+environments where that route is exposed.
+
+The production image includes pinned `cross-encoder/quora-distilroberta-base` weights, but the
+reranker remains disabled until deployment sets
+`LLM_ROUTER_RERANK_MODEL_ID=/opt/models/quora-distilroberta-base`. Spring first retrieves pgvector
+candidates and then sends the query and at most 16 candidates to `/router/rerank`. FastAPI returns
+positionally aligned scores and `modelVersion`; Spring keeps the model-version-specific threshold
+and treats a disabled or failed reranker as a cache miss. Do not enable it until the false-hit gate
+and Spring fallback contract are approved.
 
 If `LLM_ROUTER_INTERNAL_API_TOKEN` is set, Spring must send it as a bearer token:
 
@@ -55,9 +66,9 @@ stronger workload identity/mTLS layer.
 
 ## Container deployment on GCP
 
-The OCI image embeds the pinned BGE safetensors during `docker build` and starts as UID/GID 10001.
-It therefore needs Hugging Face access only in the image build environment, not on the serving VM
-or Kubernetes node.
+The OCI image embeds the pinned BGE and optional cross-encoder weights during `docker build` and
+starts as UID/GID 10001. It therefore needs Hugging Face access only in the image build environment,
+not on the serving VM or Kubernetes node.
 
 ```bash
 docker build -t llm-router-serving:0.1.0 .

@@ -42,6 +42,7 @@ HTTP event 검증부터 ML artifact 생성, GCS 저장, Vertex 제출, 상태 �
 | Endpoint | 용도 | 호출 주체 |
 | --- | --- | --- |
 | `POST /router/embed` | 질문 embedding | Spring |
+| `POST /router/rerank` | pgvector 후보의 선택적 정밀 점수 | Spring |
 | `POST /router/classify` | 난이도 분류 | Spring |
 | `GET /health` | inference readiness | load balancer·운영 도구 |
 | `POST /escalate` | inline feedback 접수와 재학습 제출 | Spring |
@@ -98,7 +99,45 @@ Success: `200 OK`
 `embedding`은 FastAPI에서 L2 정규화된 1,024차원 vector다. Spring은
 `modelVersion`이 다른 embedding을 같은 cache 공간에서 비교하지 않는다.
 
-### 3.2 `POST /router/classify`
+### 3.2 `POST /router/rerank`
+
+Spring이 pgvector에서 찾은 후보를 질문과 함께 보낸다. FastAPI는 cache를 조회하거나
+hit/miss를 결정하지 않고, 입력 순서와 같은 순서로 cross-encoder 점수만 반환한다.
+
+Request:
+
+```json
+{
+  "query": "How does photosynthesis work?",
+  "candidates": [
+    "Why do plants need sunlight?",
+    "How do plants convert light into chemical energy?"
+  ]
+}
+```
+
+Success: `200 OK`
+
+```json
+{
+  "scores": [0.013, 0.941],
+  "modelVersion": "cross-encoder/quora-distilroberta-base@f62e7a4"
+}
+```
+
+- `scores[i]`는 `candidates[i]`의 점수다. FastAPI는 정렬하지 않는다.
+- 배포 기본 후보 상한은 16개다.
+- 점수 scale과 threshold는 `modelVersion`에 종속되며 Spring이 관리한다.
+- 리랭커가 비활성·미로딩 상태면 `503 RERANK_MODEL_NOT_READY`다. Spring은 이를 cache
+  miss로 처리하고 기존 `/router/classify`·LLM 경로로 진행한다.
+- 리랭커가 반환한 값이 유한수가 아니거나 추론 계약을 위반하면
+  `500 RERANK_INFERENCE_FAILED`다. 이 경우에도 캐시 응답을 사용하지 않는다.
+
+리랭커는 false-hit 감소를 위한 선택 계층이며 기본 비활성이다. Spring은 리랭커 점수를
+서로 다른 `modelVersion` 사이에서 비교하거나, cosine threshold와 같은 수치 scale로
+해석하지 않는다.
+
+### 3.3 `POST /router/classify`
 
 Request는 `/router/embed`와 같다.
 
@@ -126,7 +165,7 @@ routing policy로 관리한다. `modelVersion`은 이후 escalation event의
 확률화·보정한 0~1 값이어야 한다. offline 비교 backbone의 raw logit이나 생성 확률을
 이 API 값으로 보내지 않는다.
 
-### 3.3 `GET /health`
+### 3.4 `GET /health`
 
 Ready: `200 OK`
 
@@ -134,7 +173,8 @@ Ready: `200 OK`
 {
   "status": "ok",
   "embedModel": "loaded",
-  "routerModel": "loaded"
+  "routerModel": "loaded",
+  "rerankModel": "disabled"
 }
 ```
 
@@ -144,11 +184,14 @@ Ready: `200 OK`
 {
   "status": "not_ready",
   "embedModel": "loaded",
-  "routerModel": "loading"
+  "routerModel": "loading",
+  "rerankModel": "loaded"
 }
 ```
 
-`/health`는 load balancer의 readiness 용도다. 현재 model version을 확인하는 API가 아니다.
+`rerankModel`은 `disabled | loading | loaded | error`다. 선택 계층이므로 readiness는
+`embedModel`과 `routerModel`만으로 결정한다. `/health`는 load balancer의 readiness 용도며
+현재 model version을 확인하는 API가 아니다.
 
 ## 4. `POST /escalate`
 
@@ -552,6 +595,9 @@ Spring의 기본 polling 규칙은 다음과 같다.
 
 최소한 다음을 Spring과 FastAPI 양쪽 contract test로 고정한다.
 
+- `/router/rerank`의 `scores[i]`가 입력 `candidates[i]`와 순서대로 대응한다.
+- 리랭커 비활성·오류·503을 Spring이 cache miss로 처리하고 `modelVersion`별 threshold를
+  섞지 않는다.
 - 1개 event가 포함된 `feedback-inline-v1` 요청이 202가 된다.
 - 빈 `events`와 `eventCount`, `manifestUri`, `eventsUri`가 포함된 요청은 422가 된다.
 - 같은 event를 다른 배열 순서와 다른 `requestedAt`으로 재시도해도 같은 run ID가 나온다.

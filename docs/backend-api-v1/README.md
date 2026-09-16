@@ -11,5 +11,9 @@ Spring 팀은 다음 파일을 기준으로 구현한다.
 Spring은 OpenAPI의 `Routing`, `Health`, `Retraining`, `Model` tag를 사용한다.
 `Developer` tag는 별도 개발자 credential용이므로 Spring client 생성 대상에서 제외한다.
 
+`POST /router/rerank`는 선택 계약이다. Spring이 pgvector 후보를 보낸 뒤 응답 순서를
+보존해 model-version별 threshold를 적용한다. 리랭커가 비활성·미로딩 상태로 503을
+반환하거나 추론에 실패하면 cache miss로 처리하며 `/router/classify` 경로를 계속한다.
+
 OpenAPI server URL의 `host` 변수는 환경별 FastAPI 주소로 바꾼다.
 `pipelineRunId`는 HTTP URL이 아니며 `statusUrl`만 FastAPI base URL에 resolve한다.

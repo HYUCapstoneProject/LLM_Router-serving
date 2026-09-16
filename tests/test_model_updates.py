@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from llm_router_serving.inference import ClassificationResult, EmbeddingResult
+from llm_router_serving.inference import ClassificationResult, EmbeddingResult, RerankResult
 from llm_router_serving.model_manager import ModelManager
 from llm_router_serving.model_source import CurrentModelPointer
 from llm_router_serving.model_updates import ModelPointerWatcher
-from llm_router_serving.schemas import RoutedModel, Tier
+from llm_router_serving.schemas import ModelLoadStatusOrDisabled, RoutedModel, Tier
 
 
 class FakeEmbedder:
@@ -28,6 +28,13 @@ class FakeClassifier:
             confidence=1.0,
             model_version=self.model_version,
         )
+
+
+class FakeReranker:
+    model_version = "reranker-v1"
+
+    def rerank(self, query: str, candidates: list[str]) -> RerankResult:
+        return RerankResult(scores=[1.0] * len(candidates), model_version=self.model_version)
 
 
 @pytest.mark.asyncio
@@ -93,3 +100,26 @@ async def test_failed_reload_keeps_the_last_known_good_model():
     assert manager.router_model_version() == "router-old"
     assert manager.classification_engine() is not None
     assert watcher.snapshot().last_load_error == "broken candidate"
+
+
+@pytest.mark.asyncio
+async def test_router_reload_keeps_the_optional_reranker_loaded():
+    reranker = FakeReranker()
+    manager = ModelManager(
+        embed_loader=FakeEmbedder,
+        router_loader=lambda: FakeClassifier("router-old"),
+        router_version_loader=lambda package_uri, model_version, manifest_sha256: FakeClassifier(
+            model_version
+        ),
+        rerank_loader=lambda: reranker,
+    )
+    await manager.load_all()
+
+    assert await manager.reload_router(
+        package_uri="gs://bucket/models/router-new/approved",
+        model_version="router-new",
+        manifest_sha256="c" * 64,
+    )
+    assert manager.router_model_version() == "router-new"
+    assert manager.rerank_engine() is reranker
+    assert manager.snapshot().rerank_status is ModelLoadStatusOrDisabled.LOADED

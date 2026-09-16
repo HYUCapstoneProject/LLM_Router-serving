@@ -147,9 +147,7 @@ def test_escalate_returns_202_and_pipeline_run_id(client, auth_headers, escalati
         "batchId": "feedback-20260812-0001",
         "pipelineRunId": "pipeline-run-123",
         "logicalModelVersion": "1.1",
-        "candidateModelVersion": (
-            "router-modernbert-feedback-v1.1-20260812-a1b2c3d4-21c2f1b"
-        ),
+        "candidateModelVersion": ("router-modernbert-feedback-v1.1-20260812-a1b2c3d4-21c2f1b"),
         "trainingMode": "minor_fine_tune",
         "versionPolicyMode": "successfulHttpRequest",
         "statusUrl": "/retraining-runs/feedback-20260812-0001",
