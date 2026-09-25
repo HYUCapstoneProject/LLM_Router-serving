@@ -2,8 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from enum import StrEnum
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -81,6 +90,26 @@ class ClassifyResponse(StrictModel):
     model: RoutedModel
     confidence: float = Field(ge=0.0, le=1.0)
     modelVersion: str
+
+
+class ClassifyV2Response(StrictModel):
+    schemaVersion: Literal["router-decision-v2"] = "router-decision-v2"
+    tier: Tier
+    model: RoutedModel
+    modelVersion: str
+    objective: Literal["ordinal", "pointwise", "pairwise"]
+    policyVersion: str
+    policySha256: str
+    candidatePoolVersion: str
+    candidateModelIds: dict[str, str]
+    action: Literal["low", "medium", "high"]
+    scoreSemantics: Literal[
+        "difficulty_class_probabilities",
+        "independent_success_probabilities",
+        "relative_quality_scores",
+    ]
+    actionScores: dict[str, FiniteFloat]
+    confidence: float | None = Field(ge=0.0, le=1.0, allow_inf_nan=False)
 
 
 class ModelLoadStatus(StrEnum):

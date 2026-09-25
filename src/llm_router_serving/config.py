@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from pydantic import SecretStr, field_validator
@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     retraining_rebase_every_major_cycles: int = 5
     retraining_replay_rows_per_label: int = 32
     retraining_version_policy_mode: str = "successfulHttpRequest"
+    retraining_input_contract: Literal["legacy-word-only-v1", "structure-preserving-v2"] = (
+        "legacy-word-only-v1"
+    )
     retraining_derived_data_root_uri: str | None = None
     retraining_observability_root_uri: str | None = None
     retraining_control_root_uri: str | None = None
@@ -92,6 +95,9 @@ class Settings(BaseSettings):
     evaluation_config_uri: str | None = None
     package_metadata_uri: str | None = None
     baseline_metrics_uri: str | None = None
+    model_evaluation_metrics_filename: Literal["routerarena_metrics.json", "gate_metrics.json"] = (
+        "routerarena_metrics.json"
+    )
     gate_rules_uri: str | None = None
 
     @field_validator("allowed_gcs_buckets", "supported_feedback_schemas", mode="before")

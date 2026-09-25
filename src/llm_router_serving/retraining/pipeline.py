@@ -159,6 +159,7 @@ class VertexPipelineClient:
 
     def state(self, run_id: str) -> PipelineState:
         from google.cloud import aiplatform
+        from google.cloud.aiplatform_v1.types import PipelineState as VertexPipelineState
 
         try:
             job = aiplatform.PipelineJob.get(
@@ -168,7 +169,18 @@ class VertexPipelineClient:
             )
         except Exception as exc:
             self._raise_mapped(exc, submission=False)
-        raw_state = str(getattr(job, "state", "") or "").split(".")[-1].upper()
+        value = getattr(job, "state", None)
+        # Python 3.11+ IntEnum.__str__ returns its number, not its enum name.
+        # Normalize integer wire values through the SDK as well; future values
+        # remain UNKNOWN so an unrecognized state never releases an active lease.
+        raw_state = getattr(value, "name", None)
+        if raw_state is None:
+            raw_state = str(value or "").split(".")[-1].upper()
+            if raw_state.isdecimal():
+                try:
+                    raw_state = VertexPipelineState(int(raw_state)).name
+                except ValueError:
+                    return PipelineState.UNKNOWN
         if raw_state in self._TERMINAL_STATES:
             return self._TERMINAL_STATES[raw_state]
         if raw_state in self._ACTIVE_STATES:

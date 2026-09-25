@@ -7,6 +7,13 @@ from threading import Lock
 from typing import Any, ClassVar, Protocol
 
 from llm_router_serving.errors import ModelContractError
+from llm_router_serving.retraining.structured_text import clean_text
+from llm_router_serving.routing_policy import (
+    RoutingDecision,
+    RoutingPolicy,
+    RoutingPolicyError,
+    route_scores,
+)
 from llm_router_serving.schemas import RoutedModel, Tier
 
 # The embedder and the classifier are loaded concurrently on startup, each in its
@@ -15,6 +22,10 @@ from llm_router_serving.schemas import RoutedModel, Tier
 # thread is still importing and fail with a spurious ImportError. Import the
 # symbols under one lock so no thread ever sees a half-initialized module.
 _TRANSFORMERS_IMPORT_LOCK = Lock()
+
+
+class InvalidRoutingInputError(ValueError):
+    """The v2 input is empty after the frozen text normalization contract."""
 
 
 @dataclass(frozen=True)
@@ -183,6 +194,8 @@ class TransformersModernBertClassifier:
         device: Any,
         model_version: str,
         max_length: int,
+        routing_policy: RoutingPolicy | None = None,
+        package_manifest_sha256: str | None = None,
     ) -> None:
         self._tokenizer = tokenizer
         self._model = model
@@ -190,6 +203,27 @@ class TransformersModernBertClassifier:
         self._device = device
         self.model_version = model_version
         self._max_length = max_length
+        if routing_policy is not None and max_length != routing_policy.max_length:
+            raise ModelContractError("Router max_length differs from the package routing policy")
+        self._routing_policy = routing_policy
+        self._objective = getattr(getattr(model, "config", None), "router_objective", "ordinal")
+        self.package_manifest_sha256 = package_manifest_sha256
+
+    @property
+    def requires_v2(self) -> bool:
+        return self._routing_policy is not None or self._objective != "ordinal"
+
+    @property
+    def supports_routing_v2(self) -> bool:
+        return self._routing_policy is not None
+
+    @property
+    def candidate_model_ids(self) -> dict[str, str]:
+        if self._routing_policy is None:
+            raise ModelContractError("An explicit service routing policy is not configured")
+        return {
+            candidate.action: candidate.model_id for candidate in self._routing_policy.candidates
+        }
 
     @classmethod
     def load(
@@ -199,6 +233,8 @@ class TransformersModernBertClassifier:
         model_version: str,
         max_length: int,
         device_name: str,
+        routing_policy: RoutingPolicy | None = None,
+        package_manifest_sha256: str | None = None,
     ) -> TransformersModernBertClassifier:
         with _TRANSFORMERS_IMPORT_LOCK:
             import torch
@@ -206,7 +242,7 @@ class TransformersModernBertClassifier:
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         model = AutoModelForSequenceClassification.from_pretrained(model_path)
-        cls._validate_label_contract(model.config)
+        cls._validate_label_contract(model.config, routing_policy=routing_policy)
         device = resolve_torch_device(torch, device_name)
         model.to(device)
         model.eval()
@@ -217,21 +253,56 @@ class TransformersModernBertClassifier:
             device=device,
             model_version=model_version,
             max_length=max_length,
+            routing_policy=routing_policy,
+            package_manifest_sha256=package_manifest_sha256,
         )
 
     @classmethod
-    def _validate_label_contract(cls, config: Any) -> None:
+    def _validate_label_contract(
+        cls, config: Any, *, routing_policy: RoutingPolicy | None = None
+    ) -> None:
         if int(getattr(config, "num_labels", 0)) != 3:
             raise ModelContractError("ModernBERT checkpoint must have exactly three labels")
         raw_id2label = getattr(config, "id2label", {}) or {}
         actual = tuple(str(raw_id2label.get(index, "")).lower() for index in range(3))
-        expected = tuple(label.value for label in cls._EXPECTED_LABELS)
+        objective = getattr(config, "router_objective", "ordinal")
+        if routing_policy is None and objective != "ordinal":
+            raise ModelContractError(
+                "Non-ordinal checkpoints require an explicit v2 routing policy"
+            )
+        if routing_policy is not None and routing_policy.objective != objective:
+            raise ModelContractError("Checkpoint objective differs from its routing policy")
+        expected = (
+            routing_policy.output_label_order
+            if routing_policy is not None
+            else tuple(label.value for label in cls._EXPECTED_LABELS)
+        )
         if actual != expected:
             raise ModelContractError(
                 f"ModernBERT label order must be {expected}; checkpoint contains {actual}"
             )
 
     def classify(self, message: str) -> ClassificationResult:
+        if self.requires_v2:
+            raise ModelContractError("This router requires /router/classify/v2")
+        logits = self._predict_logits(message)
+        probabilities = self._torch.softmax(logits, dim=-1)[0]
+        label_id = int(self._torch.argmax(probabilities).item())
+        confidence = float(probabilities[label_id].item())
+
+        tier = self._EXPECTED_LABELS[label_id]
+        return ClassificationResult(
+            tier=tier,
+            model=self._MODEL_HINTS[tier],
+            confidence=confidence,
+            model_version=self.model_version,
+        )
+
+    def _predict_logits(self, message: str) -> Any:
+        if self._routing_policy is not None:
+            message = clean_text(message)
+            if not message.strip():
+                raise InvalidRoutingInputError("message is empty after routing normalization")
         inputs = self._tokenizer(
             message,
             return_tensors="pt",
@@ -241,17 +312,20 @@ class TransformersModernBertClassifier:
         inputs = {name: value.to(self._device) for name, value in inputs.items()}
         with self._torch.inference_mode():
             logits = self._model(**inputs).logits
-            probabilities = self._torch.softmax(logits, dim=-1)[0]
-            label_id = int(self._torch.argmax(probabilities).item())
-            confidence = float(probabilities[label_id].item())
+        if tuple(logits.shape) != (1, 3) or not bool(self._torch.isfinite(logits).all()):
+            raise ModelContractError("Router must return three finite logits for one question")
+        return logits
 
-        tier = self._EXPECTED_LABELS[label_id]
-        return ClassificationResult(
-            tier=tier,
-            model=self._MODEL_HINTS[tier],
-            confidence=confidence,
-            model_version=self.model_version,
+    def classify_v2(self, message: str) -> RoutingDecision:
+        if self._routing_policy is None:
+            raise ModelContractError("An explicit service routing policy is not configured")
+        logits = (
+            self._predict_logits(message)[0].detach().to("cpu", dtype=self._torch.float32).tolist()
         )
+        try:
+            return route_scores(self._routing_policy, logits)
+        except RoutingPolicyError as exc:
+            raise ModelContractError(str(exc)) from exc
 
 
 class TransformersCrossEncoderReranker:
