@@ -1,28 +1,49 @@
 # LLM_Router-serving
 
-FastAPI server for ML routing, embedding, optional cache reranking, and feedback-retraining
-orchestration. The current production-compatible classifier is ModernBERT; the HTTP contract itself
-is router-backbone neutral.
+Spring을 위한 BGE 임베딩, 선택적 캐시 재채점, ModernBERT 난이도 분류·명시적 후보 선택과 feedback 재학습 연동 서비스다.
+기준일은 2026-09-25이며, 이 문서는 저장소 구현을 설명한다. 실제 배포 이미지·GCS 내용·클라우드 실행 완료 여부는 별도로 확인한다.
 
-## Implemented API
+문서는 다음 세 개만 유지한다. 변경은 해당 내용을 소유하는 문서에 반영한다.
 
-| Method | Path | Behavior |
-| --- | --- | --- |
-| `POST` | `/router/embed` | CLS-pooled, L2-normalized 1,024-dimensional BGE embedding |
-| `POST` | `/router/rerank` | Optional cross-encoder scores for Spring's pgvector candidates |
-| `POST` | `/router/classify` | Active router's `easy`/`medium`/`hard` classification |
-| `GET` | `/health` | BGE/router readiness plus optional reranker state |
-| `POST` | `/escalate` | Validates inline feedback, materializes GCS artifacts, and submits Vertex retraining |
-| `GET` | `/retraining-runs/{batchId}` | Retraining stage, result, and model-activation status |
-| `GET` | `/router/model/current` | Desired, serving, and previous known-good model status |
-| `GET/PUT` | `/developer/retraining/version-policy` | Developer-only version trigger policy |
+| 문서 | 단일 책임 |
+| --- | --- |
+| 이 README | 실행·설정·책임 경계·모델 전달 |
+| [API 계약](docs/api-contract.md) | Spring HTTP, 개발자 API, 상태와 관측 해석 |
+| [예시 안내](docs/examples/README.md) | 보존한 JSON·OpenAPI의 현행/과거 구분 |
 
-The server does not query pgvector, own the cache threshold, or select the actual LLM. Spring owns
-candidate lookup, cache hit/miss, and the tier-to-model mapping.
+학습 데이터·비교 실험·평가·feedback 및 캐시 실험은 [ML 최종 명세](../LLM_Router/docs/ml/README.md)가 소유한다.
+과거 설정과 전환 단계는 [deprecated settings](../LLM_Router/docs/deprecated-settings.md)에만 남긴다.
 
-## Local setup
+## 책임과 처리 흐름
 
-Python 3.11 or 3.12 is required. Python 3.12 is the project default.
+```mermaid
+flowchart LR
+    S[Spring] --> E[FastAPI BGE]
+    E --> P[Spring pgvector 캐시 후보 검색]
+    P --> R[선택적 FastAPI rerank]
+    R --> H[Spring 캐시 판정]
+    P --> H
+    H -->|hit| A[저장 응답]
+    H -->|miss| M[FastAPI ModernBERT]
+    M --> L[Spring 실제 LLM 선택·호출]
+    L --> F[Spring 상향 피드백·PII 제거]
+    F --> I[FastAPI inline 검증·GCS artifact]
+    I --> V[Vertex AI Pipelines]
+    V --> T[Vertex Custom Training]
+    T --> G[평가·gate·자동 승인]
+    G --> C[GCS CURRENT.json]
+    C --> M
+```
+
+- Spring: 공개 서비스, pgvector, cache hit/miss 및 threshold, provider 모델 ID와 호출, 피드백 선택·PII 제거·전송 시점을 담당한다.
+- FastAPI: 임베딩·재채점·난이도 추론, inline feedback 검증·Parquet/manifest 생성·GCS 게시·Vertex 제출, 승인 모델 적재를 담당한다.
+- ML pipeline: 공통 학습 코어, 전처리·학습·평가·gate·package·자동 승격을 담당한다. 코드가 KFP SDK로 작성되어 있어도 실행 대상은 managed Vertex AI Pipelines이며 GKE 운영을 전제하지 않는다.
+
+현재 loader·자동 승격·continual retraining은 ModernBERT 전용이다. [명시적 routing v2](docs/api-contract.md#routing-policy-v2)는 R0/R1/R2 추론과 package 검증을 지원하지만, R1/R2의 online feedback·학습·승격 gate가 완성됐다는 뜻은 아니다. R3 또는 다른 backbone의 연구 checkpoint는 이 계약만으로 적재할 수 없다. 최초 학습과 실제 feedback 실험의 실행 범위는 [ML 명세](../LLM_Router/docs/ml/README.md#retraining)를 따른다.
+
+## 로컬 실행
+
+Python 3.11/3.12를 지원하며 기본은 3.12다.
 
 ```bash
 python3.12 -m venv .venv
@@ -30,208 +51,81 @@ python3.12 -m venv .venv
 cp .env.example .env
 ```
 
-Configure the active router's `CURRENT.json` pointer (or a fixed approved package and version) in `.env`.
-BGE defaults to
-`BAAI/bge-large-en-v1.5` revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`. Local execution
-downloads it into the Hugging Face cache on first startup. The production Docker image downloads
-only the safetensors and tokenizer files at build time and runs with Hugging Face offline mode, so a
-GCP instance does not depend on Hugging Face availability during startup.
+[`.env.example`](.env.example)은 변수 목록을 확인하는 템플릿이다. 포함된 날짜·commit·버킷·v2 artifact·smoke gate는 현재 배포의 증거가 아니며 그대로 운영 설정으로 사용하지 않는다. 사용할 승인 package와 실행 계약에 맞춰 값을 채운다. 모델 소스 선택은 [Settings](src/llm_router_serving/config.py)의 검증을 따른다.
 
 ```bash
 .venv/bin/uvicorn llm_router_serving.main:app --host 0.0.0.0 --port 8000
 ```
 
-Model loading runs in the background. `/health` returns `503` until BGE and the router are loaded and
-returns `200` afterward. The optional reranker is reported as `disabled`, `loading`, `loaded`, or
-`error`, but never gates readiness. Interactive OpenAPI documentation is available at `/docs` in
-environments where that route is exposed.
+모델은 background로 적재한다. `/health`는 BGE와 router가 모두 준비되어야 200, 그 전에는 503이다. 선택적 reranker는 readiness에 영향을 주지 않는다. `/docs`와 `/openapi.json`은 실행 앱의 계약 확인 경로다.
 
-The production image includes pinned `cross-encoder/quora-distilroberta-base` weights, but the
-reranker remains disabled until deployment sets
-`LLM_ROUTER_RERANK_MODEL_ID=/opt/models/quora-distilroberta-base`. Spring first retrieves pgvector
-candidates and then sends the query and at most 16 candidates to `/router/rerank`. FastAPI returns
-positionally aligned scores and `modelVersion`; Spring keeps the model-version-specific threshold
-and treats a disabled or failed reranker as a cache miss. Do not enable it until the false-hit gate
-and Spring fallback contract are approved.
+`LLM_ROUTER_INTERNAL_API_TOKEN`을 설정하면 `/health`를 제외한 내부 업무 API에 bearer token이 필요하다. 미설정 시 애플리케이션 인증이 꺼지므로 로컬 개발 외에는 내부 네트워크 제한과 인증을 구성한다. 개발자 API는 별도 feature flag/token으로 보호한다.
 
-If `LLM_ROUTER_INTERNAL_API_TOKEN` is set, Spring must send it as a bearer token:
+## 모델 설정
 
-```text
-Authorization: Bearer <token>
-```
+| 대상 | 현행 기본값·동작 |
+| --- | --- |
+| BGE | `BAAI/bge-large-en-v1.5`, revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`; CLS pooling, L2 정규화, 1,024차원, prefix 없음, 512 token truncation |
+| Router | legacy v1 ordinal은 `easy=0, medium=1, hard=2`와 설정 기본 최대 길이 8,192; 명시적 v2 package는 objective별 label·정책을 검증하고 512토큰 고정 |
+| Reranker | 기본 비활성; 이미지에 `cross-encoder/quora-distilroberta-base` revision `f62e7a4b20b97195c2868e53ec59126df5eac743` 포함, 최대 길이 512, 기본 후보 16개 |
+| 장치 | `LLM_ROUTER_MODEL_DEVICE=auto`: CUDA 사용 가능 시 CUDA, 아니면 CPU |
 
-For local development only, leaving the variable unset disables application-level authentication.
-Production traffic must still be restricted by network policy and must configure the token or a
-stronger workload identity/mTLS layer.
+`modelVersion`은 설정/패키지에서 반환하는 식별자다. embedding 출력에 revision이 자동으로 붙는다고 가정하지 않는다. 임베딩·reranker가 바뀌면 version 식별자와 Spring의 cache namespace/threshold를 함께 바꾼다.
 
-## Container deployment on GCP
+Reranker 사용은 `LLM_ROUTER_RERANK_MODEL_ID=/opt/models/quora-distilroberta-base`로 명시한다. 캐시 실험에서 threshold와 잘못된 재사용 비율을 검증하고 Spring의 실패→cache miss 처리를 연결한 배포에서 활성화한다.
 
-The OCI image embeds the pinned BGE and optional cross-encoder weights during `docker build` and
-starts as UID/GID 10001. It therefore needs Hugging Face access only in the image build environment,
-not on the serving VM or Kubernetes node.
+## 컨테이너와 모델 전달
+
+[Dockerfile](Dockerfile)은 BGE와 reranker를 build 시 다운로드하고 runtime은 Hugging Face offline mode로 실행한다. 모델 다운로드는 image build 환경에만 필요하다. UID/GID는 10001이다.
 
 ```bash
-docker build -t llm-router-serving:0.1.0 .
+docker build -t llm-router-serving:local .
 ```
 
-The persistent `var` directory must be mounted. Do not put GCP service-account keys in the image;
-on a GCE-hosted container use the attached VM service account for GCS and Vertex AI access.
+배포는 이미지 digest와 환경 설정을 기록하고 `/app/var`를 UID 10001이 쓸 수 있는 영속 volume에 연결한다. service-account JSON key는 이미지에 넣지 않고 실행 환경의 Google identity/ADC를 사용한다. GPU 설정에는 호환 NVIDIA runtime이 필요하다.
 
-```bash
-docker run --rm -p 8000:8000 \
-  -e LLM_ROUTER_INTERNAL_API_TOKEN=replace-with-secret \
-  -e LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI=gs://llm-router/models/router-modernbert/CURRENT.json \
-  -v /absolute/path/to/persistent-var:/app/var \
-  llm-router-serving:0.1.0
-```
+| 설정 | 역할 |
+| --- | --- |
+| `LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI` | 배포가 추적할 `CURRENT.json`; 생략 시 publish root에서 유도 |
+| `LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI`, `LLM_ROUTER_ROUTER_MODEL_VERSION` | 고정 승인 package·초기 재학습 anchor 식별 |
+| `LLM_ROUTER_ROUTER_MODEL_PATH` | 로컬 개발 모델 디렉터리 |
+| `LLM_ROUTER_ROUTER_MODEL_CACHE_DIR` | 다운로드 cache, 기본 `var/models` |
+| `LLM_ROUTER_ROUTER_MODEL_REQUIRE_APPROVED` | 기본 `true`, 미승인 package 거부 |
+| `LLM_ROUTER_ROUTER_MODEL_AUTO_RELOAD`, `LLM_ROUTER_ROUTER_MODEL_POLL_INTERVAL_SECONDS` | watcher 활성·기본 60초 간격 |
 
-Set `LLM_ROUTER_MODEL_DEVICE=cuda` only on a GPU node with a compatible NVIDIA container runtime;
-otherwise the default `auto` selects CUDA when available and CPU otherwise. Readiness must probe
-`GET /health`; it returns HTTP 503 until both BGE and the router have loaded.
+승인 pipeline이 package와 `CURRENT.json`을 게시하면 watcher가 새 package를 별도로 다운로드한다. `model_manifest.json`의 schema, label 순서, version, 파일별 SHA-256 및 pointer의 manifest SHA-256을 확인하고 로딩이 끝난 뒤 classifier 참조를 교체한다. 실패하면 직전 모델을 유지하고, 진행 중 요청도 이미 얻은 classifier로 완료한다. 실제 반영은 `/router/model/current`와 상태 API의 `activation`으로 확인한다.
 
-## Approved model delivery
+## 재학습 운영 설정
 
-Model delivery is pull-based and automatic. The Vertex AI pipeline evaluates the checkpoint,
-enforces the deploy gate, publishes the checksummed package, marks it approved, and atomically moves
-`CURRENT.json`. The serving process polls that pointer and swaps only a fully downloaded and verified
-classifier:
+변수의 전체 목록과 기본값은 [Settings](src/llm_router_serving/config.py), 설정 초안은 [`.env.example`](.env.example), 학습 정책과 실험 차이는 [ML 명세](../LLM_Router/docs/ml/README.md#retraining)가 기준이다.
 
-```text
-Vertex AI Pipeline -> evaluate -> deploy gate
-  -> gs://<bucket>/models/router-modernbert/<version>/candidate/
-  -> automatic approve -> <version>/approved/ and atomic CURRENT.json update
-  -> FastAPI notices CURRENT.json, downloads and verifies the package beside the active model
-  -> atomic in-memory classifier swap; in-flight requests finish on the previous model
-```
+| 설정 묶음 | 필수 확인 |
+| --- | --- |
+| `VERTEX_*` | project/location, GCS의 컴파일된 pipeline template, pipeline root, pipeline/training service account와 output 경로 |
+| `BASE_TRAINING_DATASET_URI`, `FEEDBACK_PREPROCESSING_CONFIG_URI`, `TRAINING_CONFIG_URI` | 서로 같은 데이터·전처리·학습 계약인지 확인 |
+| `ROUTERARENA_DATASET_URI`, `EVALUATION_CONFIG_URI`, `BASELINE_METRICS_URI`, `GATE_RULES_URI` | 현재 코드의 평가 입력 변수명; 연구용 독립 gate와 기존 RouterArena 경로의 차이는 ML 실행 차이표 참조 |
+| `PACKAGE_METADATA_URI`, `MODEL_PUBLISH_ROOT_URI`, `MODEL_CODE_COMMIT` | package 계보, 자동 승격 root, 실제 학습 이미지의 source commit |
+| `RETRAINING_DERIVED_DATA_ROOT_URI` | immutable cycle/replay feedback 저장 |
+| `RETRAINING_OBSERVABILITY_ROOT_URI` | run별 단계 집계·heartbeat·결과 저장 |
+| `RETRAINING_CONTROL_ROOT_URI` | `validatedUniqueBatch`의 digest ledger용 |
+| `RETRAINING_DB_PATH`, `ALLOWED_GCS_BUCKETS` | 영속 SQLite 경로·허용 bucket |
 
-`LLM_ROUTER_ROUTER_MODEL_PATH` is the development source. Deployment should set
-`LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI`; when it is omitted, the service derives
-`CURRENT.json` from `LLM_ROUTER_MODEL_PUBLISH_ROOT_URI`. A fixed
-`LLM_ROUTER_ROUTER_MODEL_PACKAGE_URI` plus version remains available for bootstrap and rollback
-compatibility.
+표의 모든 변수명 앞에는 `LLM_ROUTER_`를 붙인다. dataset/config URI는 template의 기본값을 덮어쓰므로 계약 전환 시 dataset, config, metadata, IR과 image를 함께 고정한다. 현재 v2 경로를 최신 실험 데이터로 자동 간주하지 않는다. 설정 검증은 존재·호환성 검사가 아니므로 실제 object, IAM, checksum과 승인 baseline/gate를 실행 전에 확인한다. 느슨한 smoke gate와 빈 baseline은 운영 평가 기준이 아니다.
 
-During startup and every pointer refresh the process downloads the package into
-`LLM_ROUTER_ROUTER_MODEL_CACHE_DIR`
-(default `var/models/<version>`) and verifies it against `model_manifest.json`: schema version,
-`easy=0, medium=1, hard=2` label order, `model_version`, and the SHA-256 of every listed file. With
-`LLM_ROUTER_ROUTER_MODEL_REQUIRE_APPROVED=true` (the default) a package whose `gate_status` is not
-`approved` is refused, so a candidate can never be served by accident. Verification runs before the
-directory is published into the cache, so a failed download leaves no usable model behind, and
-the active classifier remains unchanged. `LLM_ROUTER_ROUTER_MODEL_POLL_INTERVAL_SECONDS` controls
-the refresh interval and defaults to 60 seconds.
+FastAPI runtime identity에는 해당 prefix의 object 읽기·생성·필요한 정리 권한, Vertex 제출 권한, 사용할 pipeline service account에 대한 실행 권한이 필요하다. pipeline/training identity의 데이터·모델·관측 artifact 권한은 별도로 설정한다. Spring에는 재학습용 GCS/Vertex 권한이 필요 없다.
 
-Mount the cache directory on the same persistent volume as `var` to avoid re-downloading packages.
-Reload is load-before-swap: a corrupt or incompatible new package leaves the last known-good model
-serving. `modernbert-publish rollback` moves `CURRENT.json` to the previous approved package, and the
-same watcher automatically loads it.
+SQLite에는 batch fingerprint·run ID·version lineage와 policy가 저장된다. 한 FastAPI replica와 영속 volume을 전제하며, 다중 replica는 공유 transactional store/lease 도입 후 적용한다. 제출 중 process가 종료되어 run ID가 없는 lease는 기본 900초 이후 다음 제출에서 Vertex의 결정적 job ID와 대조해 채택 또는 해제한다.
 
-The current package/loader contract intentionally remains ModernBERT sequence-classification v1.
-MiniLM, RoBERTa, DeBERTa, Qwen, and TF-IDF are trained/evaluated only in the sibling repository's
-Colab comparison notebooks; they are never submitted through this service's KFP/Vertex path. This
-service does not load or continually retrain them. Keep `models/router-modernbert/CURRENT.json` as
-the sole automatic promotion pointer. A future family migration requires a separate decision and
-implementation.
+GCS는 dataset·config·model·관측값을 보관하고, Artifact Registry는 container image를 보관한다. 소스 압축 업로드는 선택적 백업이며 서버를 실행하지 않는다. 필요한 경우 commit으로 추적되는 source만 별도 version 경로에 보관하고 secret·`.env`·credential·`var`·가상환경·model cache를 제외한다. 업로드 전 목록을 확인하고 내려받은 archive의 SHA-256을 대조한다. 실행 SQLite 백업은 source archive와 분리한다.
 
-## Retraining configuration
-
-`POST /escalate` is enabled only when all Vertex AI and GCS configuration variables in
-[`.env.example`](.env.example) are set. `LLM_ROUTER_VERTEX_PIPELINE_TEMPLATE_URI` must be the
-`gs://` URI of the compiled `feedback-retraining-pipeline.yaml` produced by the sibling `LLM_Router`
-repository; the IR is read from GCS, not from the serving image.
-`LLM_ROUTER_MODEL_CODE_COMMIT` must be the Git commit used by the retraining image and is included in
-the candidate model version.
-
-The current continual policy accepts any request with at least one inline event. Spring sends the
-full event array and FastAPI owns Parquet/manifest/GCS materialization. Three successfully promoted
-HTTP calls advance `n.0 -> n.1 -> n.2 -> (n+1).0`; every fifth major consolidation initializes from
-the pinned pristine ModernBERT instead of the approved anchor. FastAPI materializes the current
-three-call cycle plus a label-stratified replay capped by
-`LLM_ROUTER_RETRAINING_REPLAY_ROWS_PER_LABEL`, while the ML pipeline adds a 144-row deterministic
-RouterBench rehearsal set. The call-count trigger is intentionally fixed at three for the current
-research phase.
-
-Submission uses `google.cloud.aiplatform.PipelineJob` against managed Vertex AI Pipelines. GKE and
-self-hosted Kubeflow are not used. The Vertex `job_id` is derived deterministically from `batchId`,
-so a duplicate submission is rejected by Vertex itself with `AlreadyExists` and returns the existing
-run instead of starting a second training run.
-
-The dataset and config URIs are sent as pipeline parameters and therefore **override** the defaults
-compiled into the IR. They must stay on the v2 contract that the ML repository builds
-(`minimum-sufficient-tier-v2` labeling, `routerbench-training-preprocess-v2-balanced` preprocessing,
-`modernbert_t4_balanced_v2.json` training). Pointing `LLM_ROUTER_TRAINING_CONFIG_URI` or
-`LLM_ROUTER_BASE_TRAINING_DATASET_URI` at a v1 artifact retrains the router on the old contract
-without any error, so treat these as versioned artifacts and change them together.
-
-### Filling in `.env` for the first time
-
-`Settings.retraining_configuration_errors()` only checks that these variables are set and look like
-`gs://` URIs. It does **not** check that the object actually exists. A well-formed URI pointing at
-nothing passes local validation and only fails when Vertex tries to import that artifact at pipeline
-submission time, so verify existence yourself before submitting:
-
-```bash
-gcloud storage objects describe "$LLM_ROUTER_GATE_RULES_URI"
-```
-
-What to do with each group of variables the first time you configure a project:
-
-| Variable(s) | Before the first real training run | After `G-8` (real baseline exists) |
-| --- | --- | --- |
-| `LLM_ROUTER_GATE_RULES_URI` | Point at `config/<version>/deploy_gate_rules_smoke.json` — a loose gate that only checks package integrity and the candidate model version, so a first run can pass the gate and exercise the full publish path | Switch to a real `deploy_gate_rules.json` with thresholds derived from the actual baseline metrics |
-| `LLM_ROUTER_BASELINE_METRICS_URI` | Point at `config/<version>/baseline_metrics_empty.json` (`{}`) — there is no approved model to compare against yet | Switch to `evaluations/<baseline-version>/metrics.json` from the approved baseline |
-| `LLM_ROUTER_BASE_TRAINING_DATASET_URI` | Required only for the **feedback-retraining** pipeline (`/escalate`). Initial ModernBERT training runs in Colab and does not use this service setting. If the approved base `training.parquet` is absent from GCS, `/escalate` submissions fail at import time even though the app starts | Should point at the dataset the current approved model was trained on |
-| `LLM_ROUTER_ROUTER_MODEL_CURRENT_POINTER_URI` | Point at the publish root's `CURRENT.json`. Until the first model is approved the router slot reports `ERROR` and `GET /health` stays `503` | Keep the same pointer; automatic promotions move it without changing deployment settings |
-| `LLM_ROUTER_INTERNAL_API_TOKEN` | Any local secret works for development; leaving it unset disables auth entirely (dev only) | A real secret, provisioned via Secret Manager in deployment, never committed |
-| `LLM_ROUTER_MODEL_CODE_COMMIT` | The Git commit actually baked into the training image you pushed (`git rev-parse --short HEAD` at build time), not whatever was last committed to this repo | Re-set on every training image rebuild |
-| `LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI` | A dedicated immutable prefix for cycle/replay Parquet written by FastAPI | Keep separate from the Vertex pipeline root so temporary-artifact lifecycle rules cannot delete the active replay |
-
-`smoke` config filenames are a deliberate signal, not a suggestion — never point production traffic
-at `deploy_gate_rules_smoke.json`. See `docs/ml/gcp-rollout-and-serving-integration-plan.md` in the
-sibling `LLM_Router` repository for the commands that create and upload the GCS layout these
-variables assume (bucket structure, `config/<version>/` prefix, service accounts, image digests).
-
-The service persists `batchId`, request fingerprint, pipeline run ID, state, logical version,
-anchor lineage, and derived feedback/replay URIs in
-`LLM_ROUTER_RETRAINING_DB_PATH`. Mount that path on persistent storage in deployment; otherwise a
-container replacement would lose the idempotency record.
-
-If the process dies after claiming the lease but before recording the pipeline run ID, the next
-`/escalate` reconciles it: a lease with no run ID that is older than
-`LLM_ROUTER_RETRAINING_STALE_SUBMISSION_SECONDS` (default 900) is checked against Vertex, then
-either adopted (the job did land, so it is not submitted twice) or released. Without this a single
-crashed submission would block every future retraining request.
-
-The current SQLite lease is suitable for one FastAPI replica. Before scaling `/escalate` across
-multiple replicas, replace it with a shared transactional database or distributed lease so the
-one-pipeline-at-a-time rule remains global.
-
-GCS and Vertex AI access use the runtime's attached Google identity (Application Default
-Credentials). Do not put service-account JSON keys in the image or repository. Spring does not need
-GCS access for `/escalate`; it sends inline JSON. The FastAPI runtime service account needs
-`roles/aiplatform.user` to submit pipeline jobs, object read access for model/config packages,
-object create access on `LLM_ROUTER_RETRAINING_DERIVED_DATA_ROOT_URI`, and
-`roles/iam.serviceAccountUser` on the pipeline service account it passes to Vertex. Scope the GCS
-permissions to the relevant buckets or prefixes rather than granting project-wide administration.
-
-## Verification
+## 검증과 구현 확인
 
 ```bash
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
 .venv/bin/pytest
-.venv/bin/python scripts/smoke_bge.py
 ```
 
-The tests use fake inference, GCS, and Vertex AI adapters and do not download model weights or submit
-cloud jobs.
+기본 테스트는 fake inference/GCS/Vertex adapter를 사용한다. 실제 모델 확인은 `scripts/smoke_bge.py`, reranker 점수 비교는 `scripts/verify_reranker_parity.py`의 실행 조건을 확인한 뒤 수행한다. 실제 cloud run과 승인 모델 변경은 별도 실행 기록으로 남긴다.
 
-## Documentation
-
-- [Integrated Colab comparison/initial training and ModernBERT feedback-retraining plan](../LLM_Router/docs/ml/integrated-routing-data-and-model-comparison-plan.md)
-- [FastAPI internal API contract](docs/api-contract.md)
-- [Spring backend integration handoff](docs/backend-integration-handoff.md)
-- [Inline escalation feedback v1](docs/escalation-feedback-inline-v1.md)
-- [Legacy GCS escalation feedback batch v0.1](docs/escalation-feedback-batch-v0.1.md)
-- [Retraining API implementation and rollout plan](docs/retraining-api-implementation-plan.md)
-- [Serving and retraining architecture](docs/serving-and-retraining-architecture.md)
-- [FastAPI source upload to GCS guide](docs/gcs-source-upload-guide.md)
+HTTP·상태 처리의 현재 한계는 [API 계약의 구현 범위](docs/api-contract.md#implementation)에서 확인한다. 이 문서 정리는 코드 변경이나 클라우드 배포 완료를 의미하지 않는다.

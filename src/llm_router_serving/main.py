@@ -17,6 +17,7 @@ from llm_router_serving.errors import ApiError, ModelContractError
 from llm_router_serving.inference import (
     ClassificationEngine,
     EmbeddingEngine,
+    InvalidRoutingInputError,
     RerankEngine,
     TransformersBgeEmbedder,
     TransformersCrossEncoderReranker,
@@ -54,6 +55,7 @@ from llm_router_serving.retraining.store import (
 )
 from llm_router_serving.schemas import (
     ClassifyResponse,
+    ClassifyV2Response,
     CurrentModelResponse,
     CurrentModelStatus,
     DesiredModel,
@@ -157,8 +159,12 @@ def _build_model_manager(settings: Settings) -> ModelManager:
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
-            max_length=settings.router_max_length,
+            max_length=resolved.routing_policy.max_length
+            if resolved.routing_policy
+            else settings.router_max_length,
             device_name=settings.model_device,
+            routing_policy=resolved.routing_policy,
+            package_manifest_sha256=resolved.manifest_sha256,
         )
 
     def load_router() -> ClassificationEngine:
@@ -193,8 +199,12 @@ def _build_model_manager(settings: Settings) -> ModelManager:
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
-            max_length=settings.router_max_length,
+            max_length=resolved.routing_policy.max_length
+            if resolved.routing_policy
+            else settings.router_max_length,
             device_name=settings.model_device,
+            routing_policy=resolved.routing_policy,
+            package_manifest_sha256=resolved.manifest_sha256,
         )
 
     def load_rerank() -> RerankEngine:
@@ -221,12 +231,25 @@ def _build_model_pointer_watcher(
     if not settings.router_model_auto_reload or not pointer_uri:
         return None
     pointer_store = GcsPackageStore(project=settings.vertex_project)
+
+    def load_pointer() -> CurrentModelPointer:
+        pointer = read_current_model_pointer(pointer_uri, object_store=pointer_store)
+        engine = model_manager.classification_engine()
+        loaded_digest = getattr(engine, "package_manifest_sha256", None)
+        if (
+            engine is not None
+            and engine.model_version == pointer.model_version
+            and loaded_digest is not None
+            and loaded_digest != pointer.manifest_sha256
+        ):
+            raise ModelSourceError(
+                "An immutable model version cannot change its package or policy digest"
+            )
+        return pointer
+
     return ModelPointerWatcher(
         model_manager=model_manager,
-        pointer_loader=lambda: read_current_model_pointer(
-            pointer_uri,
-            object_store=pointer_store,
-        ),
+        pointer_loader=load_pointer,
         poll_interval_seconds=settings.router_model_poll_interval_seconds,
     )
 
@@ -410,7 +433,7 @@ def create_app(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
         logger.info("Request validation failed: %s", exc.errors())
-        if request.url.path in {"/router/embed", "/router/classify"}:
+        if request.url.path in {"/router/embed", "/router/classify", "/router/classify/v2"}:
             return _error_response(
                 request,
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -493,6 +516,12 @@ def create_app(
                 "ROUTER_MODEL_NOT_READY",
                 "router model is not loaded",
             )
+        if getattr(engine, "requires_v2", False):
+            raise ApiError(
+                status.HTTP_409_CONFLICT,
+                "ROUTER_API_VERSION_REQUIRED",
+                "this routing policy requires /router/classify/v2",
+            )
         try:
             result = await asyncio.to_thread(engine.classify, payload.message)
         except Exception as exc:
@@ -507,6 +536,52 @@ def create_app(
             model=result.model,
             confidence=result.confidence,
             modelVersion=result.model_version,
+        )
+
+    @app.post(
+        "/router/classify/v2",
+        response_model=ClassifyV2Response,
+        responses={400: {"model": ErrorResponse}, 503: {"model": ErrorResponse}},
+    )
+    async def classify_v2(payload: MessageRequest, _: InternalAuth) -> ClassifyV2Response:
+        validate_message_length(payload.message)
+        engine = model_manager.classification_engine()
+        if engine is None:
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "ROUTER_MODEL_NOT_READY",
+                "router model is not loaded",
+            )
+        if not getattr(engine, "supports_routing_v2", False):
+            raise ApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "ROUTER_POLICY_NOT_CONFIGURED",
+                "an explicit service routing policy is not configured",
+            )
+        try:
+            decision = await asyncio.to_thread(engine.classify_v2, payload.message)
+        except InvalidRoutingInputError as exc:
+            raise ApiError(status.HTTP_400_BAD_REQUEST, "INVALID_MESSAGE", str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Router v2 inference failed")
+            raise ApiError(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "ROUTER_INFERENCE_FAILED",
+                "router inference failed",
+            ) from exc
+        return ClassifyV2Response(
+            tier=decision.tier_projection,
+            model=decision.model,
+            modelVersion=engine.model_version,
+            objective=decision.objective,
+            policyVersion=decision.policy_version,
+            policySha256=decision.policy_sha256,
+            candidatePoolVersion=decision.candidate_pool_version,
+            candidateModelIds=engine.candidate_model_ids,
+            action=decision.action,
+            scoreSemantics=decision.score_semantics,
+            actionScores=decision.action_scores,
+            confidence=decision.confidence,
         )
 
     @app.post(

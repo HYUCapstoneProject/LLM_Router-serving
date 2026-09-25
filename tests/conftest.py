@@ -14,7 +14,60 @@ from llm_router_serving.inference import (
 from llm_router_serving.main import create_app
 from llm_router_serving.model_manager import ModelManager
 from llm_router_serving.retraining.service import AcceptedRetraining
+from llm_router_serving.routing_policy import OBJECTIVE_SCORE_SEMANTICS, compute_policy_sha256
 from llm_router_serving.schemas import RoutedModel, Tier
+
+
+@pytest.fixture
+def policy_payload_factory():
+    """Synthetic policies only; no service configuration is chosen by the tests."""
+
+    def build(objective="pointwise", lambda_cost=0.25):
+        payload = {
+            "schema_version": "routing-policy-v2",
+            "scope": "service-explicit",
+            "policy_version": "fixture-policy-v2",
+            "objective": objective,
+            "input_contract": "structure-preserving-v2",
+            "max_length": 512,
+            "action_order": ["low", "medium", "high"],
+            "score_semantics": OBJECTIVE_SCORE_SEMANTICS[objective],
+            "lambda_cost": lambda_cost,
+            "candidate_pool": {
+                "version": "fixture-service-pool-v1",
+                "price_version": "fixture-prices-v1",
+                "decision_cost_version": "fixture-pre-request-costs-v1",
+                "decision_cost_basis": "pre-request-fixed",
+                "cost_unit": "normalized-0-1",
+                "candidates": [
+                    {
+                        "action": "low",
+                        "tier_projection": "easy",
+                        "model": "haiku",
+                        "model_id": "fixture-provider/small-model-v1",
+                        "decision_cost": 0.0,
+                    },
+                    {
+                        "action": "medium",
+                        "tier_projection": "medium",
+                        "model": "sonnet",
+                        "model_id": "fixture-provider/mid-model-v1",
+                        "decision_cost": 0.3,
+                    },
+                    {
+                        "action": "high",
+                        "tier_projection": "hard",
+                        "model": "opus",
+                        "model_id": "fixture-provider/large-model-v1",
+                        "decision_cost": 1.0,
+                    },
+                ],
+            },
+        }
+        payload["policy_sha256"] = compute_policy_sha256(payload)
+        return payload
+
+    return build
 
 
 class FakeEmbedder:

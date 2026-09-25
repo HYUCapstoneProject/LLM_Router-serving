@@ -186,7 +186,7 @@ class EscalationService:
             else:
                 await self._reconcile_unsubmitted_job(job)
 
-    async def _reconcile_submitted_job(self, job: RetrainingJob) -> None:
+    async def _reconcile_submitted_job(self, job: RetrainingJob) -> PipelineState:
         assert job.pipeline_run_id is not None
         state = await asyncio.to_thread(self._pipeline_client.state, job.pipeline_run_id)
         if state is PipelineState.SUCCEEDED:
@@ -204,6 +204,7 @@ class EscalationService:
                 batch_id=job.batch_id,
                 status=state.value,
             )
+        return state
 
     async def _reconcile_unsubmitted_job(self, job: RetrainingJob) -> None:
         """Resolve a lease claimed but never recorded as submitted.
@@ -299,7 +300,10 @@ class EscalationService:
         settings = self._settings
         baseline_metrics_uri = str(settings.baseline_metrics_uri)
         if plan.baseline_model_version != settings.router_model_version:
-            baseline_metrics_uri = f"{plan.baseline_model_uri.rstrip('/')}/metrics.json"
+            baseline_metrics_uri = (
+                f"{plan.baseline_model_uri.rstrip('/')}/"
+                f"{settings.model_evaluation_metrics_filename}"
+            )
         arguments = {
             "base_training_dataset_uri": str(settings.base_training_dataset_uri),
             "feedback_manifest_uri": materialized.manifest_uri,
@@ -392,7 +396,12 @@ class EscalationService:
         warnings: list[str] = []
         if job.status in {"submitted", "running", "pending", "canceling", "paused"}:
             try:
-                await self._reconcile_submitted_job(job)
+                pipeline_state = await self._reconcile_submitted_job(job)
+                if pipeline_state is PipelineState.UNKNOWN:
+                    stale = True
+                    warnings.append(
+                        "pipeline returned an unrecognized state; active lease retained"
+                    )
             except Exception as exc:
                 stale = True
                 warnings.append(f"pipeline status refresh unavailable: {type(exc).__name__}")
@@ -810,18 +819,23 @@ class EscalationService:
             decisionDistribution=dict(payload.get("merge_decision_distribution", {})),
         )
 
-    @staticmethod
-    def _canonical_batch_digest(request: EscalateRequest) -> str:
+    def _canonical_batch_digest(self, request: EscalateRequest) -> str:
         groups: dict[str, list[str]] = defaultdict(list)
+        structured = self._settings.retraining_input_contract == "structure-preserving-v2"
         for event in request.events:
-            normalized = " ".join(
-                re.findall(r"\w+", unicodedata.normalize("NFKC", event.question).casefold())
-            )
+            if structured:
+                from llm_router_serving.retraining.structured_text import structured_duplicate_key
+
+                normalized = structured_duplicate_key(event.question)
+            else:
+                normalized = " ".join(
+                    re.findall(r"\w+", unicodedata.normalize("NFKC", event.question).casefold())
+                )
             groups[normalized].append(event.finalLabel.value)
         rows = []
         for question, labels in sorted(groups.items()):
             distinct = set(labels)
-            if not question or len(distinct) != 1:
+            if not question.strip() or len(distinct) != 1:
                 continue
             repeat_count = len(labels)
             rows.append(
@@ -831,7 +845,24 @@ class EscalationService:
                     "sampleWeight": min(2.0, 1.0 + (repeat_count - 1) * 0.25),
                 }
             )
-        canonical = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if structured:
+            # This v2 envelope matches the ML producer's canonical digest.
+            payload = {
+                "input_contract": "structure-preserving-v2",
+                "rows": [
+                    {
+                        "normalized_question": row["normalizedQuestion"],
+                        "final_label": row["finalLabel"],
+                        "sample_weight": row["sampleWeight"],
+                    }
+                    for row in rows
+                ],
+            }
+            canonical = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        else:
+            canonical = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
 
     def _materialize_feedback(

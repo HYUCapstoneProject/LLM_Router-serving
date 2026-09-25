@@ -672,6 +672,81 @@ async def test_submit_passes_service_account_and_publish_root(tmp_path):
     assert "training_network" not in arguments
 
 
+async def test_successor_uses_approved_gate_metrics_as_its_baseline(tmp_path):
+    first_request = build_request("feedback-20260812-first")
+    service, pipeline = build_service(tmp_path, first_request)
+    service._settings.model_evaluation_metrics_filename = "gate_metrics.json"
+    first = await service.submit(first_request)
+    assert pipeline.submissions[0][1]["baseline_metrics_uri"] == (
+        "gs://llm-router/eval/baseline.json"
+    )
+    pipeline.states[first.pipeline_run_id] = PipelineState.SUCCEEDED
+    second_request = build_request("feedback-20260812-second")
+    await service.submit(second_request)
+    assert pipeline.submissions[1][1]["baseline_metrics_uri"] == (
+        "gs://llm-router/models/router-modernbert/"
+        f"{first.candidate_model_version}/approved/gate_metrics.json"
+    )
+
+
+def test_structured_digest_preserves_code_and_excludes_conflicting_feedback(tmp_path):
+    questions = [
+        "계산: x+y",
+        "계산: x-y",
+        "  if X:\n    return Y",
+        "if X:\n    return Y",
+        "계산: ｘ＋ｙ",  # noqa: RUF001 - NFKC-equivalent feedback must collapse.
+        "동일 질문",
+        "동일 질문",
+    ]
+    events = [
+        {
+            **build_event(f"event-{index}"),
+            "question": question,
+            "finalLabel": "medium" if index == 6 else "hard",
+        }
+        for index, question in enumerate(questions)
+    ]
+    request = build_request().model_copy(
+        update={
+            "events": [type(build_request().events[0]).model_validate(event) for event in events]
+        }
+    )
+    service, _ = build_service(tmp_path, request)
+    service._settings.retraining_input_contract = "structure-preserving-v2"
+    expected_rows = [
+        {"normalized_question": question, "final_label": "hard", "sample_weight": weight}
+        for question, weight in sorted(
+            [
+                ("계산: x+y", 1.25),
+                ("계산: x-y", 1.0),
+                ("  if X:\n    return Y", 1.0),
+                ("if X:\n    return Y", 1.0),
+            ]
+        )
+    ]
+    expected = hashlib.sha256(
+        json.dumps(
+            {
+                "input_contract": "structure-preserving-v2",
+                "rows": expected_rows,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    assert service._canonical_batch_digest(request) == expected
+    assert (
+        service._canonical_batch_digest(
+            request.model_copy(update={"events": list(reversed(request.events))})
+        )
+        == expected
+    )
+    service._settings.retraining_input_contract = "legacy-word-only-v1"
+    assert service._canonical_batch_digest(request) != expected
+
+
 def test_vertex_job_id_is_deterministic_and_valid():
     first = vertex_job_id("retrain-Feedback_20260812/0001")
     second = vertex_job_id("retrain-Feedback_20260812/0001")
@@ -775,6 +850,60 @@ def test_vertex_client_maps_pipeline_states(monkeypatch, raw_state, expected):
     )
 
     assert _vertex_client().state("resource") is expected
+
+
+@pytest.mark.parametrize("representation", ["enum", "integer", "numeric_string"])
+def test_vertex_client_maps_real_sdk_states(monkeypatch, representation):
+    from google.cloud.aiplatform_v1.types import PipelineState as VertexPipelineState
+
+    for sdk_state in VertexPipelineState:
+        raw_state = {
+            "enum": sdk_state,
+            "integer": int(sdk_state),
+            "numeric_string": str(int(sdk_state)),
+        }[representation]
+        monkeypatch.setattr(
+            "google.cloud.aiplatform.PipelineJob.get",
+            staticmethod(lambda state=raw_state, **kwargs: FakeVertexJob("resource", state)),
+        )
+        expected = {
+            "PIPELINE_STATE_SUCCEEDED": PipelineState.SUCCEEDED,
+            "PIPELINE_STATE_FAILED": PipelineState.FAILED,
+            "PIPELINE_STATE_CANCELLED": PipelineState.CANCELLED,
+            "PIPELINE_STATE_UNSPECIFIED": PipelineState.UNKNOWN,
+        }.get(sdk_state.name, PipelineState.ACTIVE)
+        assert _vertex_client().state("resource") is expected
+
+
+@pytest.mark.asyncio
+async def test_unknown_pipeline_state_is_stale_retains_lease_and_recovers(tmp_path):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    pipeline.states[accepted.pipeline_run_id] = PipelineState.UNKNOWN
+    stale = await service.status(
+        request.batchId,
+        serving_model_version="router-old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert stale.stale is True
+    assert stale.terminal is False
+    assert any("unrecognized state" in warning for warning in stale.warnings)
+    assert service._job_store.get(request.batchId).status == "submitted"
+    with pytest.raises(RetrainingInProgressError):
+        await service.submit(build_request("feedback-next"))
+    pipeline.states[accepted.pipeline_run_id] = PipelineState.FAILED
+    failed = await service.status(
+        request.batchId,
+        serving_model_version="router-old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert failed.status == "failed"
+    assert failed.terminal is True
+    assert failed.stale is False
+    assert service._job_store.list_active() == []
 
 
 def test_vertex_client_maps_permission_denied_to_authorization_error(monkeypatch):

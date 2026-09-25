@@ -23,10 +23,13 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 from urllib.parse import urlparse
 
+from llm_router_serving.routing_policy import RoutingPolicy, RoutingPolicyError, load_routing_policy
+
 logger = logging.getLogger(__name__)
 
 MANIFEST_FILENAME = "model_manifest.json"
 PACKAGE_SCHEMA_VERSION = "model-package-v1"
+POLICY_PACKAGE_SCHEMA_VERSION = "model-package-v2"
 CURRENT_POINTER_SCHEMA_VERSION = "router-current-model-v1"
 EXPECTED_ID2LABEL = {"0": "easy", "1": "medium", "2": "hard"}
 REQUIRED_PACKAGE_FILES = frozenset(
@@ -50,6 +53,8 @@ class ResolvedModel:
     path: Path
     model_version: str
     package_uri: str | None
+    routing_policy: RoutingPolicy | None = None
+    manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -223,9 +228,10 @@ def verify_package(
     if not isinstance(manifest, dict):
         raise ModelSourceError(f"{MANIFEST_FILENAME} must contain a JSON object")
 
-    if manifest.get("schema_version") != PACKAGE_SCHEMA_VERSION:
+    package_schema = manifest.get("schema_version")
+    if package_schema not in {PACKAGE_SCHEMA_VERSION, POLICY_PACKAGE_SCHEMA_VERSION}:
         raise ModelSourceError(f"Unsupported package schema: {manifest.get('schema_version')!r}")
-    if manifest.get("id2label") != EXPECTED_ID2LABEL:
+    if package_schema == PACKAGE_SCHEMA_VERSION and manifest.get("id2label") != EXPECTED_ID2LABEL:
         raise ModelSourceError("Package labels must be easy=0, medium=1, hard=2")
     if manifest.get("model_version") != expected_model_version:
         raise ModelSourceError(
@@ -242,7 +248,10 @@ def verify_package(
     files = manifest.get("files")
     if not isinstance(files, dict) or not files:
         raise ModelSourceError(f"{MANIFEST_FILENAME} files must be a non-empty object")
-    missing_required = sorted(REQUIRED_PACKAGE_FILES - set(files))
+    required_files = REQUIRED_PACKAGE_FILES | (
+        {"routing_policy.json"} if package_schema == POLICY_PACKAGE_SCHEMA_VERSION else set()
+    )
+    missing_required = sorted(required_files - set(files))
     if missing_required:
         raise ModelSourceError(f"Package manifest is missing required files: {missing_required}")
     if not any(name in files for name in ("model.safetensors", "pytorch_model.bin")):
@@ -259,7 +268,78 @@ def verify_package(
         expected = str(expected_sha256).removeprefix("sha256:").lower()
         if actual != expected:
             raise ModelSourceError(f"SHA-256 mismatch for {relative_name}")
+    try:
+        model_config = json.loads((package_dir / "config.json").read_text())
+        if package_schema == POLICY_PACKAGE_SCHEMA_VERSION:
+            policy = _read_package_policy(package_dir, manifest)
+            expected_labels = {
+                str(index): label for index, label in enumerate(policy.output_label_order)
+            }
+            expected_label_ids = {label: int(index) for index, label in expected_labels.items()}
+            training_config = json.loads((package_dir / "training_config.json").read_text())
+            if (
+                manifest.get("objective") != policy.objective
+                or model_config.get("router_objective") != policy.objective
+                or training_config.get("objective_method", "ordinal") != policy.objective
+            ):
+                raise ModelSourceError(
+                    "Package, checkpoint, training and policy objectives must match"
+                )
+            if (
+                manifest.get("id2label") != expected_labels
+                or model_config.get("id2label") != expected_labels
+                or model_config.get("label2id") != expected_label_ids
+            ):
+                raise ModelSourceError("Policy package output labels differ from its objective")
+            if (
+                manifest.get("input_contract") != policy.input_contract
+                or manifest.get("tokenizer_max_length") != policy.max_length
+                or training_config.get("max_length") != policy.max_length
+            ):
+                raise ModelSourceError(
+                    "Policy package requires matching input contract and 512-token limit"
+                )
+        elif (
+            model_config.get("router_objective", "ordinal") != "ordinal"
+            or manifest.get("objective", "ordinal") != "ordinal"
+        ):
+            raise ModelSourceError(
+                "Non-ordinal checkpoints cannot use the legacy v1 package contract"
+            )
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ModelSourceError(f"Invalid router package contract: {exc}") from exc
     return manifest
+
+
+def _read_package_policy(package_dir: Path, manifest: dict) -> RoutingPolicy:
+    if manifest.get("routing_policy_file") != "routing_policy.json":
+        raise ModelSourceError("Policy package must name routing_policy.json explicitly")
+    expected = manifest.get("routing_policy_sha256")
+    if not expected or manifest.get("files", {}).get("routing_policy.json") != expected:
+        raise ModelSourceError("Policy file digest must match the package file manifest")
+    try:
+        return load_routing_policy(
+            package_dir / "routing_policy.json", expected_file_sha256=expected
+        )
+    except (RoutingPolicyError, OSError) as exc:
+        raise ModelSourceError(str(exc)) from exc
+
+
+def _resolved_package(
+    path: Path, model_version: str, package_uri: str | None, manifest: dict
+) -> ResolvedModel:
+    policy = (
+        _read_package_policy(path, manifest)
+        if manifest.get("schema_version") == POLICY_PACKAGE_SCHEMA_VERSION
+        else None
+    )
+    return ResolvedModel(
+        path=path,
+        model_version=model_version,
+        package_uri=package_uri,
+        routing_policy=policy,
+        manifest_sha256=_sha256_file(path / MANIFEST_FILENAME),
+    )
 
 
 def download_package(
@@ -311,6 +391,12 @@ def resolve_router_model(
     if local_path is not None:
         if not local_path.is_dir():
             raise ModelSourceError(f"Router model directory does not exist: {local_path}")
+        if (local_path / MANIFEST_FILENAME).is_file():
+            manifest = verify_package(
+                local_path, expected_model_version=model_version, require_approved=require_approved
+            )
+            _verify_expected_manifest_sha256(local_path, expected_manifest_sha256)
+            return _resolved_package(local_path, model_version, None, manifest)
         return ResolvedModel(path=local_path, model_version=model_version, package_uri=None)
     if package_uri is None:
         raise ModelSourceError("No router model path or package URI is configured")
@@ -319,13 +405,13 @@ def resolve_router_model(
     marker = target / _READY_MARKER
     if marker.is_file() and marker.read_text(encoding="utf-8").strip() == package_uri:
         logger.info("Reusing cached router model package %s", model_version)
-        verify_package(
+        manifest = verify_package(
             target,
             expected_model_version=model_version,
             require_approved=require_approved,
         )
         _verify_expected_manifest_sha256(target, expected_manifest_sha256)
-        return ResolvedModel(path=target, model_version=model_version, package_uri=package_uri)
+        return _resolved_package(target, model_version, package_uri, manifest)
 
     store = object_store or GcsPackageStore()
     staging = Path(cache_dir) / f".staging-{model_version}"
@@ -333,7 +419,7 @@ def resolve_router_model(
         shutil.rmtree(staging)
     logger.info("Downloading router model package %s from %s", model_version, package_uri)
     download_package(package_uri, staging, object_store=store)
-    verify_package(
+    manifest = verify_package(
         staging,
         expected_model_version=model_version,
         require_approved=require_approved,
@@ -348,7 +434,7 @@ def resolve_router_model(
     staging.replace(target)
     marker.write_text(package_uri, encoding="utf-8")
     logger.info("Router model package %s is ready at %s", model_version, target)
-    return ResolvedModel(path=target, model_version=model_version, package_uri=package_uri)
+    return _resolved_package(target, model_version, package_uri, manifest)
 
 
 def _verify_expected_manifest_sha256(
