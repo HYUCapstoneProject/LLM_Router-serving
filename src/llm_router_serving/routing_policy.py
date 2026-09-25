@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 POLICY_SCHEMA_VERSION = "routing-policy-v2"
+LENGTH_CONTRACT_VERSION = "train-inference-lengths-v1"
 ACTION_ORDER = ("low", "medium", "high")
 TIER_ORDER = ("easy", "medium", "hard")
 MODEL_HINT_ORDER = ("haiku", "sonnet", "opus")
@@ -96,7 +97,7 @@ def _validated_payload(values: Mapping[str, Any]) -> dict[str, Any]:
             "score_semantics",
             "lambda_cost",
             "candidate_pool",
-        },
+        } | ({"length_contract_version"} if "length_contract_version" in payload else set()),
         "policy",
     )
     if payload["schema_version"] != POLICY_SCHEMA_VERSION:
@@ -116,8 +117,12 @@ def _validated_payload(values: Mapping[str, Any]) -> dict[str, Any]:
         raise RoutingPolicyError(
             "Policy requires the structure-preserving-v2 input contract"
         )
-    if type(payload["max_length"]) is not int or payload["max_length"] != 512:
-        raise RoutingPolicyError("Service policy max_length must be exactly 512")
+    has_length_contract = "length_contract_version" in payload
+    if has_length_contract and payload["length_contract_version"] != LENGTH_CONTRACT_VERSION:
+        raise RoutingPolicyError("Unsupported policy length_contract_version")
+    allowed_lengths = {512, 8192} if has_length_contract else {512}
+    if type(payload["max_length"]) is not int or payload["max_length"] not in allowed_lengths:
+        raise RoutingPolicyError(f"Service policy max_length must be in {sorted(allowed_lengths)}")
     if payload["action_order"] != list(ACTION_ORDER):
         raise RoutingPolicyError("Action order must be low, medium, high")
     pool = _keys(
@@ -190,7 +195,8 @@ def _validated_payload(values: Mapping[str, Any]) -> dict[str, Any]:
         "policy_version": _identifier(payload["policy_version"], "policy_version"),
         "objective": objective,
         "input_contract": "structure-preserving-v2",
-        "max_length": 512,
+        "max_length": payload["max_length"],
+        **({"length_contract_version": LENGTH_CONTRACT_VERSION} if has_length_contract else {}),
         "action_order": list(ACTION_ORDER),
         "score_semantics": OBJECTIVE_SCORE_SEMANTICS[objective],
         "lambda_cost": _finite_number(
@@ -250,6 +256,7 @@ class RoutingPolicy:
     policy_sha256: str
     input_contract: str = "structure-preserving-v2"
     max_length: int = 512
+    length_contract_version: str | None = None
 
     @classmethod
     def from_mapping(
@@ -284,6 +291,8 @@ class RoutingPolicy:
                 ServiceCandidate(**candidate) for candidate in pool["candidates"]
             ),
             policy_sha256=supplied,
+            max_length=payload["max_length"],
+            length_contract_version=payload.get("length_contract_version"),
         )
 
     @property

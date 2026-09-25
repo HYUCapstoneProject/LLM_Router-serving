@@ -23,7 +23,12 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 from urllib.parse import urlparse
 
-from llm_router_serving.routing_policy import RoutingPolicy, RoutingPolicyError, load_routing_policy
+from llm_router_serving.routing_policy import (
+    LENGTH_CONTRACT_VERSION,
+    RoutingPolicy,
+    RoutingPolicyError,
+    load_routing_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,9 @@ class ResolvedModel:
     package_uri: str | None
     routing_policy: RoutingPolicy | None = None
     manifest_sha256: str | None = None
+    input_contract: str | None = None
+    max_length: int | None = None
+    training_max_length: int | None = None
 
 
 @dataclass(frozen=True)
@@ -270,13 +278,14 @@ def verify_package(
             raise ModelSourceError(f"SHA-256 mismatch for {relative_name}")
     try:
         model_config = json.loads((package_dir / "config.json").read_text())
+        training_config = json.loads((package_dir / "training_config.json").read_text())
+        has_length_contract = _verify_length_contract(manifest, training_config, model_config)
         if package_schema == POLICY_PACKAGE_SCHEMA_VERSION:
             policy = _read_package_policy(package_dir, manifest)
             expected_labels = {
                 str(index): label for index, label in enumerate(policy.output_label_order)
             }
             expected_label_ids = {label: int(index) for index, label in expected_labels.items()}
-            training_config = json.loads((package_dir / "training_config.json").read_text())
             if (
                 manifest.get("objective") != policy.objective
                 or model_config.get("router_objective") != policy.objective
@@ -293,12 +302,18 @@ def verify_package(
                 raise ModelSourceError("Policy package output labels differ from its objective")
             if (
                 manifest.get("input_contract") != policy.input_contract
+                or type(manifest.get("tokenizer_max_length")) is not int
                 or manifest.get("tokenizer_max_length") != policy.max_length
-                or training_config.get("max_length") != policy.max_length
+                or manifest.get("length_contract_version") != policy.length_contract_version
             ):
                 raise ModelSourceError(
-                    "Policy package requires matching input contract and 512-token limit"
+                    "Policy package requires matching input and inference length contracts"
                 )
+            if not has_length_contract and (
+                type(training_config.get("max_length")) is not int
+                or training_config["max_length"] != 512
+            ):
+                raise ModelSourceError("Legacy policy package requires 512-token training")
         elif (
             model_config.get("router_objective", "ordinal") != "ordinal"
             or manifest.get("objective", "ordinal") != "ordinal"
@@ -306,9 +321,64 @@ def verify_package(
             raise ModelSourceError(
                 "Non-ordinal checkpoints cannot use the legacy v1 package contract"
             )
+        if (
+            package_schema == PACKAGE_SCHEMA_VERSION
+            and "input_contract" in manifest
+            and (
+                manifest["input_contract"] != "structure-preserving-v2"
+                or training_config.get("input_contract", "structure-preserving-v2")
+                != "structure-preserving-v2"
+                or training_config.get("objective_method", "ordinal") != "ordinal"
+                or (
+                    not has_length_contract
+                    and (
+                        type(manifest.get("tokenizer_max_length")) is not int
+                        or manifest["tokenizer_max_length"] != 512
+                        or type(training_config.get("max_length")) is not int
+                        or training_config["max_length"] != 512
+                    )
+                )
+            )
+        ):
+            raise ModelSourceError("Explicit v1 input contract is inconsistent")
     except (ValueError, TypeError, AttributeError) as exc:
         raise ModelSourceError(f"Invalid router package contract: {exc}") from exc
     return manifest
+
+
+def _verify_length_contract(manifest: dict, training: dict, model_config: dict) -> bool:
+    """Keep immutable training history separate from qualified serving length."""
+    if "length_contract_version" not in manifest:
+        if {"training_max_length", "inference_max_length"} & manifest.keys():
+            raise ModelSourceError("Separate lengths require length_contract_version")
+        return False
+    if manifest["length_contract_version"] != LENGTH_CONTRACT_VERSION:
+        raise ModelSourceError("Unsupported package length_contract_version")
+    if manifest.get("input_contract") != "structure-preserving-v2":
+        raise ModelSourceError("Length contract requires structure-preserving-v2 input")
+    values = {
+        "training_max_length": manifest.get("training_max_length"),
+        "inference_max_length": manifest.get("inference_max_length"),
+        "tokenizer_max_length": manifest.get("tokenizer_max_length"),
+        "training_config.max_length": training.get("max_length"),
+        "config.max_position_embeddings": model_config.get("max_position_embeddings"),
+    }
+    for name, value in values.items():
+        if type(value) is not int or value <= 0:
+            raise ModelSourceError(f"{name} must be a positive integer")
+    if values["training_max_length"] != values["training_config.max_length"]:
+        raise ModelSourceError("training_max_length differs from preserved training history")
+    if (
+        values["inference_max_length"] not in {512, 8192}
+        or values["tokenizer_max_length"] != values["inference_max_length"]
+    ):
+        raise ModelSourceError("Length contract requires matching 512 or 8192 inference limits")
+    native_limit = values["config.max_position_embeddings"]
+    if max(values["training_max_length"], values["inference_max_length"]) > native_limit:
+        raise ModelSourceError("Package length exceeds the checkpoint native position limit")
+    if training.get("input_contract", "structure-preserving-v2") != "structure-preserving-v2":
+        raise ModelSourceError("Training input contract differs from package input contract")
+    return True
 
 
 def _read_package_policy(package_dir: Path, manifest: dict) -> RoutingPolicy:
@@ -339,6 +409,9 @@ def _resolved_package(
         package_uri=package_uri,
         routing_policy=policy,
         manifest_sha256=_sha256_file(path / MANIFEST_FILENAME),
+        input_contract=manifest.get("input_contract"),
+        max_length=manifest["tokenizer_max_length"] if "input_contract" in manifest else None,
+        training_max_length=manifest.get("training_max_length"),
     )
 
 

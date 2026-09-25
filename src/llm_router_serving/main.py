@@ -161,10 +161,11 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             model_version=resolved.model_version,
             max_length=resolved.routing_policy.max_length
             if resolved.routing_policy
-            else settings.router_max_length,
+            else resolved.max_length or settings.router_max_length,
             device_name=settings.model_device,
             routing_policy=resolved.routing_policy,
             package_manifest_sha256=resolved.manifest_sha256,
+            input_contract=resolved.input_contract,
         )
 
     def load_router() -> ClassificationEngine:
@@ -201,10 +202,11 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             model_version=resolved.model_version,
             max_length=resolved.routing_policy.max_length
             if resolved.routing_policy
-            else settings.router_max_length,
+            else resolved.max_length or settings.router_max_length,
             device_name=settings.model_device,
             routing_policy=resolved.routing_policy,
             package_manifest_sha256=resolved.manifest_sha256,
+            input_contract=resolved.input_contract,
         )
 
     def load_rerank() -> RerankEngine:
@@ -524,6 +526,8 @@ def create_app(
             )
         try:
             result = await asyncio.to_thread(engine.classify, payload.message)
+        except InvalidRoutingInputError as exc:
+            raise ApiError(status.HTTP_400_BAD_REQUEST, "INVALID_MESSAGE", str(exc)) from exc
         except Exception as exc:
             logger.exception("Router inference failed")
             raise ApiError(

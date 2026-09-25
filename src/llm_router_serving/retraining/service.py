@@ -19,6 +19,7 @@ from llm_router_serving.retraining.gcs import (
 )
 from llm_router_serving.retraining.observability import (
     ObservabilitySnapshot,
+    PromotionEvidenceUnavailable,
     RetrainingObservabilityReader,
 )
 from llm_router_serving.retraining.pipeline import PipelineClient, PipelineState
@@ -182,7 +183,12 @@ class EscalationService:
         """
         for job in await asyncio.to_thread(self._job_store.list_active):
             if job.pipeline_run_id:
-                await self._reconcile_submitted_job(job)
+                try:
+                    await self._reconcile_submitted_job(job)
+                except PromotionEvidenceUnavailable:
+                    # Keep the lease: submit must not advance a cycle while
+                    # successful backend execution lacks promotion evidence.
+                    continue
             else:
                 await self._reconcile_unsubmitted_job(job)
 
@@ -190,6 +196,15 @@ class EscalationService:
         assert job.pipeline_run_id is not None
         state = await asyncio.to_thread(self._pipeline_client.state, job.pipeline_run_id)
         if state is PipelineState.SUCCEEDED:
+            if self._observability_reader is None:
+                raise PromotionEvidenceUnavailable("promotion evidence reader is not configured")
+            await asyncio.to_thread(
+                self._observability_reader.verify_promotion,
+                batch_id=job.batch_id,
+                candidate_model_version=job.candidate_model_version or "",
+                pipeline_run_id=job.pipeline_run_id,
+                publish_root_uri=self._settings.model_publish_root_uri or "",
+            )
             await asyncio.to_thread(
                 self._job_store.mark_status,
                 batch_id=job.batch_id,
@@ -402,6 +417,9 @@ class EscalationService:
                     warnings.append(
                         "pipeline returned an unrecognized state; active lease retained"
                     )
+            except PromotionEvidenceUnavailable as exc:
+                stale = True
+                warnings.append(f"promotion evidence pending: {exc}")
             except Exception as exc:
                 stale = True
                 warnings.append(f"pipeline status refresh unavailable: {type(exc).__name__}")
@@ -414,7 +432,13 @@ class EscalationService:
             observed.feedback_prepare
             and observed.feedback_prepare.get("failure_code") == "NO_UNIQUE_FEEDBACK"
         )
-        if unique_rejection or (observed.gate and observed.gate.get("passed") is False):
+        gate_rejection = (
+            observed.gate
+            and observed.gate.get("passed") is False
+            and observed.gate.get("candidate_model_version") == job.candidate_model_version
+            and observed.gate.get("pipeline_job_resource_name") == job.pipeline_run_id
+        )
+        if unique_rejection or gate_rejection:
             overall = RetrainingOverallStatus.REJECTED
             if job.status != "rejected":
                 await asyncio.to_thread(
