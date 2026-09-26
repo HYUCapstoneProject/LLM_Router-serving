@@ -32,6 +32,7 @@ from llm_router_serving.model_source import (
     resolve_router_model,
 )
 from llm_router_serving.model_updates import ModelPointerWatcher, ModelPointerWatcherSnapshot
+from llm_router_serving.profiles import validate_router_profile
 from llm_router_serving.retraining.gcs import (
     BatchValidationError,
     FeedbackBatchValidator,
@@ -156,6 +157,7 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             )
         except ModelSourceError as exc:
             raise ModelContractError(str(exc)) from exc
+        validate_router_profile(settings, resolved)
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
@@ -197,6 +199,7 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             cache_dir=settings.router_model_cache_dir,
             require_approved=settings.router_model_require_approved,
         )
+        validate_router_profile(settings, resolved)
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
@@ -672,6 +675,14 @@ def create_app(
         },
     )
     async def escalate(payload: EscalateRequest, _: InternalAuth) -> EscalateResponse:
+        engine = model_manager.classification_engine()
+        if getattr(engine, "routing_objective", "ordinal") != "ordinal":
+            raise ApiError(
+                status.HTTP_409_CONFLICT,
+                "R0_OBJECTIVE_REQUIRED",
+                "finalLabel retraining requires an ordinal model; "
+                "non-ordinal models need an explicit conversion release",
+            )
         service = app.state.escalation_service
         if service is None:
             missing = ", ".join(settings.retraining_configuration_errors())

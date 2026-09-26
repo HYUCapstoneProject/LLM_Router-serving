@@ -25,6 +25,7 @@ def validate_r0_profile(settings: Settings) -> list[str]:
         *settings.router_model_source_errors(),
     ]
     expected = {
+        "router_profile": "r0",
         "router_max_length": 8192,
         "router_model_require_approved": True,
         "router_model_auto_reload": True,

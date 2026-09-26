@@ -9,3 +9,6 @@ __pycache__
 docs
 tests
 var
+
+# Never send deployment secrets in the build context.
+deploy/*.env

@@ -224,6 +224,10 @@ class TransformersModernBertClassifier:
         self.package_manifest_sha256 = package_manifest_sha256
 
     @property
+    def routing_objective(self) -> str:
+        return self._routing_policy.objective if self._routing_policy else self._objective
+
+    @property
     def requires_v2(self) -> bool:
         if self._routing_policy is not None:
             # Only relative pairwise scores lack the numeric confidence promised by v1.
