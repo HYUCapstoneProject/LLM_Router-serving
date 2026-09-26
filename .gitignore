@@ -10,3 +10,6 @@ __pycache__/
 build/
 dist/
 var/
+
+# Local release configuration can contain the internal token.
+deploy/*.env

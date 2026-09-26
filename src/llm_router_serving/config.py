@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     router_model_version: str | None = None
     model_code_commit: str | None = None
     router_max_length: int = 8192
+    router_profile: Literal["legacy", "r0"] = "legacy"
     model_device: str = "auto"
     load_models_on_startup: bool = True
 

@@ -148,6 +148,7 @@ def build_service(tmp_path, request: EscalateRequest):
         vertex_training_service_account="train@test-project.iam.gserviceaccount.com",
         vertex_training_output_directory="gs://llm-router/vertex-training-output",
         model_publish_root_uri="gs://llm-router/models/router-modernbert",
+        retraining_observability_root_uri="gs://llm-router/retraining-runs",
     )
     store = MemoryObjectStore({})
     validator = FeedbackBatchValidator(supported_schemas=settings.supported_feedback_schemas)
@@ -156,6 +157,10 @@ def build_service(tmp_path, request: EscalateRequest):
         validator=validator,
         job_store=RetrainingJobStore(settings.retraining_db_path),
         pipeline_client=pipeline,
+        observability_reader=RetrainingObservabilityReader(
+            object_store=store,
+            root_uri=settings.retraining_observability_root_uri,
+        ),
         materializer=FeedbackReplayMaterializer(
             object_store=store,
             root_uri="gs://llm-router/derived",
@@ -163,6 +168,76 @@ def build_service(tmp_path, request: EscalateRequest):
         ),
     )
     return service, pipeline
+
+
+def complete_promotion(service, pipeline, accepted):
+    """Publish ML-compatible immutable evidence, then expose backend success."""
+    store = service._observability_reader._object_store
+    root = service._settings.model_publish_root_uri
+    run_root = service._observability_reader.run_root(accepted.batch_id)
+    candidate = accepted.candidate_model_version
+    package = f"{root}/{candidate}/approved"
+    job = accepted.pipeline_run_id
+    timestamp = "2026-09-25T00:00:00Z"
+
+    def write(uri, value):
+        raw = json.dumps(value, sort_keys=True).encode()
+        store.objects[uri] = raw
+        return hashlib.sha256(raw).hexdigest()
+
+    identity = {
+        "schema_version": "retraining-observability-v1",
+        "batch_id": accepted.batch_id,
+        "candidate_model_version": candidate,
+        "pipeline_job_resource_name": job,
+    }
+    gate_sha = write(
+        f"{run_root}/gate/gate-result.json",
+        {
+            **identity,
+            "source_schema_version": "deploy-gate-result-v1",
+            "candidate_manifest_sha256": "a" * 64,
+            "passed": True,
+        },
+    )
+    manifest_sha = write(
+        f"{package}/model_manifest.json",
+        {
+            "schema_version": "model-package-v1",
+            "model_version": candidate,
+            "gate_status": "approved",
+            "pipeline_run_id": job,
+            "approved_at": timestamp,
+        },
+    )
+    pointer_sha = write(
+        f"{root}/CURRENT.json",
+        {
+            "schema_version": "router-current-model-v1",
+            "model_version": candidate,
+            "package_uri": package,
+            "manifest_sha256": manifest_sha,
+            "candidate_manifest_sha256": "a" * 64,
+            "pipeline_run_id": job,
+            "approved_at": timestamp,
+        },
+    )
+    write(
+        f"{run_root}/result/publish-result.json",
+        {
+            **identity,
+            "source_schema_version": "r0-promotion-evidence-v1",
+            "outcome": "promoted",
+            "model_version": candidate,
+            "package_uri": package,
+            "manifest_sha256": manifest_sha,
+            "current_pointer_uri": f"{root}/CURRENT.json",
+            "current_pointer_sha256": pointer_sha,
+            "gate_result_sha256": gate_sha,
+            "approved_at": timestamp,
+        },
+    )
+    pipeline.states[job] = PipelineState.SUCCEEDED
 
 
 async def test_submit_is_idempotent_for_same_batch_and_payload(tmp_path):
@@ -206,7 +281,7 @@ async def test_status_distinguishes_pipeline_success_from_model_activation(tmp_p
     assert running.terminal is False
     assert running.activation.status == "pending"
 
-    pipeline.states[accepted.pipeline_run_id] = PipelineState.SUCCEEDED
+    complete_promotion(service, pipeline, accepted)
     succeeded = await service.status(
         request.batchId,
         serving_model_version="router-old",
@@ -245,6 +320,7 @@ async def test_status_projects_observability_metrics_and_gate_rejection(tmp_path
             {
                 "batch_id": request.batchId,
                 "candidate_model_version": accepted.candidate_model_version,
+                "pipeline_job_resource_name": accepted.pipeline_run_id,
                 "updated_at": "2026-09-12T07:12:30Z",
                 **payload,
             }
@@ -429,7 +505,7 @@ async def test_only_one_non_terminal_pipeline_can_run(tmp_path):
     with pytest.raises(RetrainingInProgressError):
         await service.submit(second_request)
 
-    pipeline.states[first.pipeline_run_id] = PipelineState.SUCCEEDED
+    complete_promotion(service, pipeline, first)
     accepted = await service.submit(second_request)
     assert accepted.pipeline_run_id == "pipeline-2"
 
@@ -449,7 +525,7 @@ async def test_three_successful_calls_make_a_major_and_fifth_major_rebases(tmp_p
         versions.append(arguments["logical_model_version"])
         modes.append(arguments["training_mode"])
         initializations.append(arguments["initialization_mode"])
-        pipeline.states[accepted.pipeline_run_id] = PipelineState.SUCCEEDED
+        complete_promotion(service, pipeline, accepted)
 
     assert versions[:4] == ["1.1", "1.2", "2.0", "2.1"]
     assert modes[2] == "major_consolidation"
@@ -508,12 +584,12 @@ async def test_service_accumulates_the_cycle_and_retires_superseded_derivatives(
 
     first = await service.submit(first_request)
     first_events_uri = pipeline.submissions[-1][1]["feedback_events_uri"]
-    pipeline.states[first.pipeline_run_id] = PipelineState.SUCCEEDED
+    complete_promotion(service, pipeline, first)
     second = await service.submit(second_request)
     second_events_uri = pipeline.submissions[-1][1]["feedback_events_uri"]
 
     assert pq.read_table(BytesIO(shared_store.objects[second_events_uri])).num_rows == 6
-    pipeline.states[second.pipeline_run_id] = PipelineState.SUCCEEDED
+    complete_promotion(service, pipeline, second)
     await service._reconcile_active_jobs()
     assert first_events_uri not in shared_store.objects
     assert second_events_uri in shared_store.objects
@@ -680,7 +756,7 @@ async def test_successor_uses_approved_gate_metrics_as_its_baseline(tmp_path):
     assert pipeline.submissions[0][1]["baseline_metrics_uri"] == (
         "gs://llm-router/eval/baseline.json"
     )
-    pipeline.states[first.pipeline_run_id] = PipelineState.SUCCEEDED
+    complete_promotion(service, pipeline, first)
     second_request = build_request("feedback-20260812-second")
     await service.submit(second_request)
     assert pipeline.submissions[1][1]["baseline_metrics_uri"] == (
@@ -916,3 +992,236 @@ def test_vertex_client_maps_permission_denied_to_authorization_error(monkeypatch
 
     with pytest.raises(PipelineAuthorizationError):
         _vertex_client().submit(run_name="retrain-feedback-1", arguments={})
+
+
+async def test_backend_success_waits_for_evidence_then_recovers(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    service._settings.retraining_calls_per_major = 1
+    policy = service._job_store.get_or_create_version_policy(default_mode="successfulHttpRequest")
+    service._job_store.schedule_version_policy_change(
+        expected_revision=policy.revision,
+        mode="validatedUniqueBatch",
+        actor="test",
+        reason="change at verified major promotion",
+    )
+    accepted = await service.submit(request)
+    assert accepted.logical_model_version == "2.0"
+    retire = AsyncMock()
+    monkeypatch.setattr(service, "_retire_superseded_feedback", retire)
+    store = service._observability_reader._object_store
+    original_feedback = dict(store.objects)
+    pipeline.states[accepted.pipeline_run_id] = PipelineState.SUCCEEDED
+    waiting = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert waiting.terminal is False and waiting.stale is True
+    assert waiting.result is None
+    assert any("promotion evidence pending" in item for item in waiting.warnings)
+    assert service._job_store.list_succeeded() == []
+    assert store.objects == original_feedback
+    retire.assert_not_awaited()
+    assert (
+        service._job_store.get_or_create_version_policy(
+            default_mode="successfulHttpRequest"
+        ).pending_mode
+        == "validatedUniqueBatch"
+    )
+    with pytest.raises(RetrainingInProgressError):
+        await service.submit(build_request("blocked-next-batch"))
+    complete_promotion(service, pipeline, accepted)
+    succeeded = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=accepted.candidate_model_version,
+        desired_load_error=None,
+    )
+    assert succeeded.status == "succeeded" and succeeded.result.gatePassed is True
+    retire.assert_awaited_once()
+    assert (
+        service._job_store.get_or_create_version_policy(default_mode="successfulHttpRequest").mode
+        == "validatedUniqueBatch"
+    )
+
+
+@pytest.mark.parametrize(
+    "artifact,field,value",
+    [
+        ("gate", "batch_id", "other"),
+        ("gate", "candidate_model_version", "other"),
+        ("gate", "pipeline_job_resource_name", "other"),
+        ("publish", "source_schema_version", "old-unverified"),
+        ("publish", "pipeline_job_resource_name", "other"),
+        ("publish", "manifest_sha256", "0" * 64),
+        ("publish", "gate_result_sha256", "0" * 64),
+        ("publish", "current_pointer_uri", "gs://untrusted/CURRENT.json"),
+        ("publish", "package_uri", "gs://untrusted/approved"),
+        ("pointer", "model_version", "other"),
+        ("pointer", "pipeline_run_id", "other"),
+        ("manifest", "gate_status", "candidate"),
+        ("manifest", "pipeline_run_id", "other"),
+    ],
+)
+async def test_promotion_evidence_tampering_preserves_feedback_and_allows_repair(
+    tmp_path,
+    monkeypatch,
+    artifact,
+    field,
+    value,
+):
+    from unittest.mock import AsyncMock
+
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    complete_promotion(service, pipeline, accepted)
+    reader = service._observability_reader
+    store = reader._object_store
+    root = service._settings.model_publish_root_uri
+    run = reader.run_root(request.batchId)
+    paths = {
+        "gate": f"{run}/gate/gate-result.json",
+        "publish": f"{run}/result/publish-result.json",
+        "pointer": f"{root}/CURRENT.json",
+        "manifest": f"{root}/{accepted.candidate_model_version}/approved/model_manifest.json",
+    }
+    uri = paths[artifact]
+    pristine = store.objects[uri]
+    payload = json.loads(pristine)
+    payload[field] = value
+    store.objects[uri] = json.dumps(payload).encode()
+    retire = AsyncMock()
+    monkeypatch.setattr(service, "_retire_superseded_feedback", retire)
+    before = dict(store.objects)
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.terminal is False and response.result is None and response.stale
+    assert service._job_store.list_succeeded() == []
+    assert store.objects == before
+    retire.assert_not_awaited()
+    store.objects[uri] = pristine
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.status == "succeeded"
+    retire.assert_awaited_once()
+
+
+async def test_success_without_reader_is_fail_closed(tmp_path):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    service._observability_reader = None
+    pipeline.states[accepted.pipeline_run_id] = PipelineState.SUCCEEDED
+    result = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert result.terminal is False and result.stale and result.result is None
+    assert service._job_store.list_succeeded() == []
+
+
+async def test_gate_rejection_after_backend_success_never_retires_feedback(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    complete_promotion(service, pipeline, accepted)
+    store = service._observability_reader._object_store
+    uri = service._observability_reader.run_root(request.batchId) + "/gate/gate-result.json"
+    payload = json.loads(store.objects[uri])
+    payload["passed"] = False
+    store.objects[uri] = json.dumps(payload).encode()
+    retire = AsyncMock()
+    monkeypatch.setattr(service, "_retire_superseded_feedback", retire)
+    before = dict(store.objects)
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.status == "rejected" and response.result.gatePassed is False
+    assert service._job_store.list_succeeded() == [] and store.objects == before
+    retire.assert_not_awaited()
+
+
+@pytest.mark.parametrize("missing", ["gate", "publish", "pointer", "manifest"])
+async def test_each_delayed_promotion_artifact_keeps_lease_until_restored(tmp_path, missing):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    complete_promotion(service, pipeline, accepted)
+    reader = service._observability_reader
+    store = reader._object_store
+    root = service._settings.model_publish_root_uri
+    run = reader.run_root(request.batchId)
+    uri = {
+        "gate": f"{run}/gate/gate-result.json",
+        "publish": f"{run}/result/publish-result.json",
+        "pointer": f"{root}/CURRENT.json",
+        "manifest": f"{root}/{accepted.candidate_model_version}/approved/model_manifest.json",
+    }[missing]
+    content = store.objects.pop(uri)
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.stale and not response.terminal and response.result is None
+    assert service._job_store.list_succeeded() == []
+    assert len(service._job_store.list_active()) == 1
+    store.objects[uri] = content
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.status == "succeeded"
+
+
+async def test_current_changes_during_verification_preserves_active_lease(tmp_path, monkeypatch):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    complete_promotion(service, pipeline, accepted)
+    store = service._observability_reader._object_store
+    pointer_uri = service._settings.model_publish_root_uri + "/CURRENT.json"
+    read = store.read_bytes
+    calls = 0
+
+    def changing_read(uri):
+        nonlocal calls
+        if uri == pointer_uri:
+            calls += 1
+            if calls == 2:
+                return b'{"model_version":"concurrent-promotion"}'
+        return read(uri)
+
+    monkeypatch.setattr(store, "read_bytes", changing_read)
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.stale and not response.terminal and response.result is None
+    assert any("CURRENT changed" in message for message in response.warnings)
+    assert service._job_store.list_succeeded() == []

@@ -32,6 +32,7 @@ from llm_router_serving.model_source import (
     resolve_router_model,
 )
 from llm_router_serving.model_updates import ModelPointerWatcher, ModelPointerWatcherSnapshot
+from llm_router_serving.profiles import validate_router_profile
 from llm_router_serving.retraining.gcs import (
     BatchValidationError,
     FeedbackBatchValidator,
@@ -156,15 +157,17 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             )
         except ModelSourceError as exc:
             raise ModelContractError(str(exc)) from exc
+        validate_router_profile(settings, resolved)
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
             max_length=resolved.routing_policy.max_length
             if resolved.routing_policy
-            else settings.router_max_length,
+            else resolved.max_length or settings.router_max_length,
             device_name=settings.model_device,
             routing_policy=resolved.routing_policy,
             package_manifest_sha256=resolved.manifest_sha256,
+            input_contract=resolved.input_contract,
         )
 
     def load_router() -> ClassificationEngine:
@@ -196,15 +199,17 @@ def _build_model_manager(settings: Settings) -> ModelManager:
             cache_dir=settings.router_model_cache_dir,
             require_approved=settings.router_model_require_approved,
         )
+        validate_router_profile(settings, resolved)
         return TransformersModernBertClassifier.load(
             model_path=resolved.path,
             model_version=resolved.model_version,
             max_length=resolved.routing_policy.max_length
             if resolved.routing_policy
-            else settings.router_max_length,
+            else resolved.max_length or settings.router_max_length,
             device_name=settings.model_device,
             routing_policy=resolved.routing_policy,
             package_manifest_sha256=resolved.manifest_sha256,
+            input_contract=resolved.input_contract,
         )
 
     def load_rerank() -> RerankEngine:
@@ -524,6 +529,8 @@ def create_app(
             )
         try:
             result = await asyncio.to_thread(engine.classify, payload.message)
+        except InvalidRoutingInputError as exc:
+            raise ApiError(status.HTTP_400_BAD_REQUEST, "INVALID_MESSAGE", str(exc)) from exc
         except Exception as exc:
             logger.exception("Router inference failed")
             raise ApiError(
@@ -668,6 +675,14 @@ def create_app(
         },
     )
     async def escalate(payload: EscalateRequest, _: InternalAuth) -> EscalateResponse:
+        engine = model_manager.classification_engine()
+        if getattr(engine, "routing_objective", "ordinal") != "ordinal":
+            raise ApiError(
+                status.HTTP_409_CONFLICT,
+                "R0_OBJECTIVE_REQUIRED",
+                "finalLabel retraining requires an ordinal model; "
+                "non-ordinal models need an explicit conversion release",
+            )
         service = app.state.escalation_service
         if service is None:
             missing = ", ".join(settings.retraining_configuration_errors())

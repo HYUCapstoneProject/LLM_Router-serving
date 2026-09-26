@@ -95,7 +95,7 @@ def classifier_for(payload, tokenizer=None):
         torch=torch,
         device=torch.device("cpu"),
         model_version=MODEL_VERSION,
-        max_length=512,
+        max_length=policy.max_length,
         routing_policy=policy,
         package_manifest_sha256="a" * 64,
     )
@@ -202,8 +202,14 @@ def test_classifier_uses_objective_scores_and_policy_cost_before_tier_projection
     assert result.confidence == (None if objective == "pairwise" else result.action_scores["low"])
     if objective == "pointwise":
         assert sum(result.action_scores.values()) > 1.0
-    with pytest.raises(ModelContractError, match="classify/v2"):
-        classifier.classify("question")
+    if objective == "pairwise":
+        with pytest.raises(ModelContractError, match="classify/v2"):
+            classifier.classify("question")
+    else:
+        compatible = classifier.classify("question")
+        assert compatible.tier.value == result.tier_projection
+        assert compatible.model.value == result.model
+        assert compatible.confidence == result.confidence
 
 
 def test_nonordinal_checkpoint_cannot_load_without_policy():
@@ -294,7 +300,14 @@ def test_v2_endpoint_retains_three_tiers_and_marks_score_semantics(
         empty = client.post("/router/classify/v2", json={"message": "\u200b"}, headers=auth_headers)
         assert empty.status_code == 400 and empty.json()["code"] == "INVALID_MESSAGE"
         legacy = client.post("/router/classify", json={"message": "question"}, headers=auth_headers)
-        assert legacy.status_code == 409 and legacy.json()["code"] == "ROUTER_API_VERSION_REQUIRED"
+        if objective == "pairwise":
+            assert legacy.status_code == 409
+            assert legacy.json()["code"] == "ROUTER_API_VERSION_REQUIRED"
+        else:
+            assert legacy.status_code == 200
+            assert legacy.json() == {
+                key: payload[key] for key in ("tier", "model", "confidence", "modelVersion")
+            }
 
 
 def test_existing_legacy_model_is_not_silently_given_a_service_policy(client, auth_headers):

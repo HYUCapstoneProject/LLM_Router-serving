@@ -20,7 +20,7 @@ Spring은 pgvector 조회, cache threshold/hit/miss, 실제 provider 모델 ID·
 | --- | ---: | --- |
 | `POST /router/embed` | 200 | BGE 임베딩 |
 | `POST /router/rerank` | 200 | 선택적 cache 후보 점수 |
-| `POST /router/classify` | 200 | ModernBERT 난이도 |
+| `POST /router/classify` | 200 | R0 난이도 분류 또는 R1 후보 선택을 기존 3단계로 반환 |
 | `GET /health` | 200/503 | 추론 readiness |
 | `POST /escalate` | 202 | inline feedback 접수·재학습 제출 |
 | `GET /retraining-runs/{batchId}` | 200 | 상태·집계·활성화 조회 |
@@ -65,7 +65,13 @@ Spring은 pgvector 조회, cache threshold/hit/miss, 실제 provider 모델 ID·
 
 `tier`는 `easy | medium | hard`, 참고값 `model`은 `haiku | sonnet | opus`다. 실제 provider ID는 Spring의 versioned routing policy가 결정한다. `modelVersion`은 실제 추론 classifier의 version이며 최초 요청 기록과 feedback의 `routerModelVersion`에 보존한다.
 
-현행 `confidence`는 3-class logits의 **raw softmax 최댓값**이다. 0~1 범위이며 보정된 정답확률을 보장하지 않는다. Serving 최대 입력은 설정 기본 8,192 token으로 truncation한다. offline 공통 비교의 512 token 계약은 배포 설정을 자동으로 바꾸지 않는다.
+응답은 R0·R1 모두 위 네 필드로 고정한다. `confidence`는 정책 없는 legacy R0에서는
+3-class logits의 raw softmax 최댓값이고, 명시적 정책을 사용하는 R0에서는 선택된
+후보의 softmax 점수, R1에서는 선택된 후보의 sigmoid 점수다. 모두 비용 차감 전
+점수이며 0~1 범위다. R1 값을 난이도 confidence나 보정된 서비스 성공 확률로 해석하지
+않는다. legacy 모델의 설정 기본 최대 길이는 8,192 token이다. 명시적 입력·길이 계약이
+있는 패키지는 검증된 패키지의 추론 길이를 사용한다. 512로 학습한 이력을 8,192로
+수정하지 않으며, 새 패키지 승격 없이 운영 길이를 자동 변경하지 않는다.
 
 ### `GET /health`
 
@@ -312,9 +318,11 @@ Spring/FastAPI 계약 검증은 field/UTC/strict boolean, inline 1건·빈 배�
 <a id="routing-policy-v2"></a>
 ## 9. 명시적 서비스 정책을 사용하는 routing v2 계약
 
-이 문서는 구현된 `model-package-v2` 적재와 `POST /router/classify/v2` 동작을 설명한다.
-이 문서의 기존 v1 HTTP 계약의 v1 요청·응답은 legacy ordinal 모델에 계속 적용된다.
-v2는 R0/R1/R2의 점수 의미와 서비스 선택 정책을 명시하면서 기존 3단계 라우팅을 유지한다.
+이 문서는 구현된 `model-package-v2` 적재와 명시적 정책의 동작을 설명한다.
+R0·R1 교체는 기존 `POST /router/classify`의 요청과 네 응답 필드를 유지한다. 별도의
+`POST /router/classify/v2`는 정책 메타데이터를 조회하는 기존 선택적 경로로 유지한다.
+패키지의 v2 schema가 서비스 클라이언트의 v2 endpoint 전환을 요구하지 않는다.
+정책은 R0/R1/R2의 점수 의미와 서비스 선택 기준을 명시하며 기존 3단계 라우팅을 유지한다.
 
 이 구현은 로컬 검증을 마친 지원 코드다. 실제 서비스 후보 모델, 비용, λ를 확정하거나
 GCS의 `CURRENT.json`을 변경하지 않았으며 운영 배포도 수행하지 않았다. 학습 결과나
@@ -329,15 +337,19 @@ GCS의 `CURRENT.json`을 변경하지 않았으며 운영 배포도 수행하지
 | 적재된 모델 | `/router/classify` | `/router/classify/v2` |
 | --- | --- | --- |
 | 명시적 v2 정책이 없는 legacy ordinal 모델 | 기존 `tier`, `model`, `confidence`, `modelVersion` 응답 | `503 ROUTER_POLICY_NOT_CONFIGURED` |
-| 검증된 명시적 v2 정책이 있는 R0/R1/R2 모델 | `409 ROUTER_API_VERSION_REQUIRED` | v2 응답 |
+| 검증된 명시적 정책이 있는 R0 ordinal·R1 pointwise 모델 | 정책 선택을 투영한 기존 네 필드 응답 | 메타데이터를 포함한 v2 응답 |
+| 검증된 명시적 정책이 있는 R2 pairwise 모델 | `409 ROUTER_API_VERSION_REQUIRED` | nullable confidence를 포함한 v2 응답 |
 | 모델 미적재 | `503 ROUTER_MODEL_NOT_READY` | `503 ROUTER_MODEL_NOT_READY` |
 
-정책이 있는 R0도 v2로 호출한다. 그렇지 않으면 비용 정책을 무시한 legacy argmax 결과를
-반환하게 되기 때문이다. R1/R2 checkpoint는 legacy v1 패키지나 정책 없는 classifier로
-적재할 수 없다. API가 목표 함수를 추측하거나 R1/R2 출력을 CE softmax로 바꾸지 않는다.
+정책이 있으면 두 endpoint 모두 같은 `route_scores()` 경로로 후보를 선택한다.
+R0에서 비용 정책이 argmax와 다른 후보를 고르더라도 기존 endpoint가 그 정책을
+우회하지 않는다. R1 confidence는 선택된 후보의 sigmoid 점수이며 R0 softmax로
+바꾸지 않는다. R1/R2 checkpoint는 legacy v1 패키지나 정책 없는 classifier로
+적재할 수 없다. R2는 기존 API의 필수 숫자 confidence를 제공할 수 없어 v2 경계를 유지한다.
 
-v2 입력이 정규화 후 비어 있으면 `400 INVALID_MESSAGE`, 추론 출력이 유효하지 않으면
-`500 ROUTER_INFERENCE_FAILED`다. v2 오류를 받은 클라이언트가 v1로 재호출하는 동작은 없다.
+구조 보존 입력이 정규화 후 비어 있으면 `400 INVALID_MESSAGE`, 추론 출력이 유효하지
+않으면 `500 ROUTER_INFERENCE_FAILED`다. 기존 endpoint에 objective나 정책 정보를
+요청 필드로 추가하지 않는다. R0·R1 선택은 배포 패키지와 내부 설정으로 결정한다.
 
 ### 9.2. 공통 3단계와 목표 함수별 점수
 
@@ -425,7 +437,7 @@ canonical policy 해시이며 실제 서비스 설정에 사용하면 안 된다
 | 영역 | 필수 내용 |
 | --- | --- |
 | 식별 | `schema_version: routing-policy-v2`, `scope: service-explicit`, `policy_version`, `objective`, `policy_sha256` |
-| 입력·출력 | `input_contract: structure-preserving-v2`, `max_length: 512`, `action_order: [low, medium, high]`, 목표 함수에 맞는 `score_semantics` |
+| 입력·출력 | `input_contract: structure-preserving-v2`, `max_length: 512` 또는 새 길이 계약의 `8192`, `action_order: [low, medium, high]`, 목표 함수에 맞는 `score_semantics` |
 | 선택 | 유한한 0 이상의 `lambda_cost` |
 | 후보 pool | `version`, `price_version`, `decision_cost_version`, `decision_cost_basis: pre-request-fixed`, `cost_unit`, 순서가 고정된 세 `candidates` |
 | 각 후보 | `action`, `tier_projection`, 논리 `model`, 실제 `model_id`, 유한한 0 이상의 `decision_cost` |
@@ -457,9 +469,10 @@ canonical 해시는 유지될 수 있다. 두 해시를 서로 대신 사용하�
 `id2label`은 `easy/medium/hard` 서비스 alias이며, R1/R2 패키지·checkpoint의 실제 출력
 label인 `low/medium/high`와 구별해 검증한다. pointer의 형식을 새 v2 응답으로 바꾸지 않는다.
 
-### 9.5. 입력 정규화와 512토큰
+### 9.5. 입력 정규화와 학습·추론 길이 분리
 
-v2 classifier는 tokenizer 전에 `structure-preserving-v2`의 `clean_text`를 적용한다.
+v2 classifier와 `input_contract: structure-preserving-v2`를 명시한 v1 classifier는
+tokenizer 전에 `clean_text`를 적용한다.
 NFKC 정규화, CRLF/CR→LF 변환, newline·tab을 제외한 Unicode category C 문자 제거,
 각 줄 끝 공백 제거, 연속 빈 줄 축약과 바깥 newline 제거를 수행한다. 학습과 동일하게
 첫 줄의 특정 객관식 안내 문장과 마지막 줄의 특정 단일 선택지 출력 안내도 제거한다.
@@ -469,10 +482,33 @@ NFKC 정규화, CRLF/CR→LF 변환, newline·tab을 제외한 Unicode category 
 본문의 indentation을 지우지 않는다. NFKC가 정규화하는 전각 문자는 바뀔 수 있다.
 정규화 결과가 공백뿐인지는 별도 검사해 거부한다.
 
-v2는 정책·manifest·training config의 길이 제한을 512로 일치시킨 뒤
-`truncation=True, max_length=512`로 tokenizer를 호출한다. 기존 설정의 더 긴
-`router_max_length`가 v2 정책을 덮어쓰지 않는다. legacy v1은 원래 raw 입력과 기존 길이
-설정을 유지한다.
+R0·R1 신규 배포 프로필의 추론 목표는 8,192토큰이다. 추가 학습 없이 길이를 확장하는
+패키지는 아래 계약을 사용한다. 학습 길이는 보존한 실제 기록과 비교하며, 추론 길이를
+따라서 바꾸지 않는다.
+
+| 위치 | 신규 8,192토큰 패키지 |
+| --- | --- |
+| manifest | `length_contract_version: train-inference-lengths-v1`, `training_max_length: 512`, `inference_max_length: 8192`, `tokenizer_max_length: 8192` |
+| `training_config.json` | 기존 학습의 `max_length: 512` 유지; manifest의 `training_max_length`와 정확히 일치 |
+| v2 policy | 같은 `length_contract_version`과 `max_length: 8192`; policy에는 학습 길이를 넣지 않음 |
+| checkpoint config | 양의 정수 `max_position_embeddings`; 학습·추론 길이가 이 한도를 넘으면 거부 |
+
+길이 필드에 boolean·문자열·실수를 허용하지 않는다. 새 계약은 추론 길이 512도
+명시할 수 있어 같은 schema로 rollback 패키지를 검증할 수 있다. marker가 없는 기존
+v2 policy/package는 512만 허용한다. marker 또는 필드를 일부만 추가·제거하거나
+manifest와 policy marker·추론 길이가 다르면 거부한다. 새로운 계약의 policy SHA는
+기존 512 policy와 다르므로 Spring의 pin도 함께 갱신해야 한다.
+
+시작 적재와 hot reload 모두 검증한 추론 길이로
+`truncation=True, max_length=<inference_max_length>`를 호출한다.
+`router_max_length` 환경 설정은 명시적 패키지 길이를 덮어쓰지 않는다. 입력 계약이
+없는 legacy v1은 원래 raw 입력과 기존 길이 설정을 유지한다. 512 길이의 기존 구조
+보존 v1 패키지도 계속 읽을 수 있다.
+
+이 계약 지원만으로 8,192의 운영 승격이 완료되지는 않는다. 실제 서비스 후보에 대한
+동일 추론 길이 gate, 운영 VM의 지연·메모리 검증과 immutable 새 모델 버전·manifest
+생성이 필요하다. 추론 길이를 바꾸며 기존 `CURRENT.json`이나 패키지를 덮어쓰지 않는다.
+검증: [길이 계약과 hot reload 테스트](../tests/test_length_contract.py).
 
 ### 9.6. 적재·교체와 롤백
 
@@ -486,19 +522,22 @@ pointer watcher는 현재 적재된 동일 물리적 `model_version`에 다른 m
 가중치 또는 정책을 바꿀 때 같은 물리적 버전을 덮어쓰는 방식은 지원하지 않는다.
 과거 승인 버전으로의 rollback도 그 버전의 원래 manifest와 정책을 사용한다.
 
-Spring v2 클라이언트는 `llm.router.classify-contract=v2`를 명시해야 한다. 기본은 v1이다.
-v2에서는 다음 설정과 응답을 함께 검사한다.
+Spring의 R0·R1 공통 서비스 경로는 기존 `/router/classify`를 사용한다. 이 네 필드
+응답에는 정책 hash·후보 ID가 없으므로 배포 시 FastAPI의 policy/package와 Spring의
+실제 모델 mapping이 같은 release 설정을 사용하는지 별도로 확인해야 한다.
+선택적 v2 클라이언트는 `llm.router.classify-contract=v2`를 명시했을 때 다음 설정과
+응답을 함께 검사한다.
 
 - `llm.router.expected-policy-sha256`: 파일 해시가 아닌 canonical policy 해시
 - `llm.router.candidate-pool-version`: 응답의 pool 버전
 - `llm.models.easy/medium/hard`: 응답의 세 실제 후보 ID 전체
 - action↔tier↔논리 model, 목표 함수↔score semantics, 점수·confidence 계약
 
-정책을 바꾼 승격이나 rollback 시 FastAPI package와 Spring의 policy pin·pool·실제 모델
-mapping을 함께 맞춰야 한다. 서버만 과거 버전으로 돌리면 Spring은 다른 policy hash를
-거부할 수 있다. 단일 pin을 사용하는 현재 구현은 전환 중 두 정책을 동시에 허용하거나
-클라이언트 설정을 자동 갱신하지 않는다. legacy v1 모델로 되돌릴 때는 클라이언트의
-contract 설정도 v1에 맞아야 한다. HTTP 오류나 계약 불일치에 대한 자동 v1 downgrade는 없다.
+정책을 바꾼 승격이나 rollback 시 FastAPI package와 Spring의 pool·실제 모델 mapping을
+함께 맞춰야 한다. v2 클라이언트에서는 policy pin도 맞춘다. 단일 pin을 사용하는 v2
+클라이언트는 전환 중 두 정책을 동시에 허용하거나 설정을 자동 갱신하지 않는다.
+기존 endpoint를 사용하는 R0·R1 전환에는 클라이언트 요청·응답 변경이 없다.
+HTTP 오류나 계약 불일치에 대한 자동 endpoint 전환은 없다.
 
 ### 9.7. 운영 활성화 전에 남은 조건
 

@@ -25,7 +25,7 @@ _TRANSFORMERS_IMPORT_LOCK = Lock()
 
 
 class InvalidRoutingInputError(ValueError):
-    """The v2 input is empty after the frozen text normalization contract."""
+    """The input is empty after the frozen text normalization contract."""
 
 
 @dataclass(frozen=True)
@@ -196,6 +196,7 @@ class TransformersModernBertClassifier:
         max_length: int,
         routing_policy: RoutingPolicy | None = None,
         package_manifest_sha256: str | None = None,
+        input_contract: str | None = None,
     ) -> None:
         self._tokenizer = tokenizer
         self._model = model
@@ -205,13 +206,33 @@ class TransformersModernBertClassifier:
         self._max_length = max_length
         if routing_policy is not None and max_length != routing_policy.max_length:
             raise ModelContractError("Router max_length differs from the package routing policy")
+        effective_contract = routing_policy.input_contract if routing_policy else input_contract
+        if effective_contract not in (None, "structure-preserving-v2"):
+            raise ModelContractError("Unsupported router input contract")
+        if routing_policy and input_contract not in (None, routing_policy.input_contract):
+            raise ModelContractError("Router input contract differs from policy")
+        if type(max_length) is not int or max_length <= 0:
+            raise ModelContractError("Router max_length must be a positive integer")
+        native_limit = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+        if native_limit is not None and (
+            type(native_limit) is not int or native_limit <= 0 or max_length > native_limit
+        ):
+            raise ModelContractError("Router max_length exceeds or lacks a valid native limit")
+        self._input_contract = effective_contract
         self._routing_policy = routing_policy
         self._objective = getattr(getattr(model, "config", None), "router_objective", "ordinal")
         self.package_manifest_sha256 = package_manifest_sha256
 
     @property
+    def routing_objective(self) -> str:
+        return self._routing_policy.objective if self._routing_policy else self._objective
+
+    @property
     def requires_v2(self) -> bool:
-        return self._routing_policy is not None or self._objective != "ordinal"
+        if self._routing_policy is not None:
+            # Only relative pairwise scores lack the numeric confidence promised by v1.
+            return self._routing_policy.objective == "pairwise"
+        return self._objective != "ordinal"
 
     @property
     def supports_routing_v2(self) -> bool:
@@ -235,6 +256,7 @@ class TransformersModernBertClassifier:
         device_name: str,
         routing_policy: RoutingPolicy | None = None,
         package_manifest_sha256: str | None = None,
+        input_contract: str | None = None,
     ) -> TransformersModernBertClassifier:
         with _TRANSFORMERS_IMPORT_LOCK:
             import torch
@@ -255,6 +277,7 @@ class TransformersModernBertClassifier:
             max_length=max_length,
             routing_policy=routing_policy,
             package_manifest_sha256=package_manifest_sha256,
+            input_contract=input_contract,
         )
 
     @classmethod
@@ -285,6 +308,18 @@ class TransformersModernBertClassifier:
     def classify(self, message: str) -> ClassificationResult:
         if self.requires_v2:
             raise ModelContractError("This router requires /router/classify/v2")
+        if self._routing_policy is not None:
+            # Preserve the existing HTTP fields while using exactly the same decision
+            # as v2. In particular, an ordinal policy may change the argmax through cost.
+            decision = self.classify_v2(message)
+            if decision.confidence is None:
+                raise ModelContractError("The existing classify contract requires confidence")
+            return ClassificationResult(
+                tier=Tier(decision.tier_projection),
+                model=RoutedModel(decision.model),
+                confidence=decision.confidence,
+                model_version=self.model_version,
+            )
         logits = self._predict_logits(message)
         probabilities = self._torch.softmax(logits, dim=-1)[0]
         label_id = int(self._torch.argmax(probabilities).item())
@@ -299,7 +334,7 @@ class TransformersModernBertClassifier:
         )
 
     def _predict_logits(self, message: str) -> Any:
-        if self._routing_policy is not None:
+        if self._input_contract == "structure-preserving-v2":
             message = clean_text(message)
             if not message.strip():
                 raise InvalidRoutingInputError("message is empty after routing normalization")

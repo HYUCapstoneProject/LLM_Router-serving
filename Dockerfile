@@ -29,6 +29,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY scripts/check-r0-readiness.py ./scripts/check-r0-readiness.py
 
 RUN python -m pip install --upgrade pip \
     && python -m pip install . \

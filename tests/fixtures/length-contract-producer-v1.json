@@ -1,0 +1,32 @@
+{
+  "schema_version": "length-contract-producer-fixture-v1",
+  "synthetic_only": true,
+  "producer": "llm_router_labeling.deployment.model_package.assemble_model_package",
+  "packages": {
+    "v1": {
+      "model_version": "router-synthetic-v1-train512-infer8192",
+      "files": {
+        "config.json": "{\"id2label\": {\"0\": \"easy\", \"1\": \"medium\", \"2\": \"hard\"}, \"label2id\": {\"easy\": 0, \"medium\": 1, \"hard\": 2}, \"max_position_embeddings\": 8192}",
+        "metrics.json": "{\"routerbench\": {\"macro_f1\": 0.81}}",
+        "model.safetensors": "synthetic model weights",
+        "model_manifest.json": "{\n  \"base_model\": \"answerdotai/ModernBERT-base@immutable\",\n  \"code_commit\": \"0123456789abcdef\",\n  \"created_at\": \"2026-09-26T00:00:00+00:00\",\n  \"dataset_version\": \"routerbench-test-v1\",\n  \"evaluation_version\": \"router-evaluation-v1\",\n  \"files\": {\n    \"config.json\": \"b824bd77791baaade7a7faa6382c830c7e5d3aca50d123b4bdff5dfe967ef51d\",\n    \"metrics.json\": \"705160bd821cd855c963ec2387b11e9c5cac014b7d61c4956f6b38971954c41d\",\n    \"model.safetensors\": \"ac09cdebf758dc9030d88cc022b58ead1b50843557d2b459d2231e345c57ce6a\",\n    \"tokenizer.json\": \"4e3043229142b64d998563bc543ce034e0a2251af5d404995e3afcb8ce8850df\",\n    \"tokenizer_config.json\": \"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\n    \"training_config.json\": \"f9f648278f27a189e49e37ee4c0771a8ab5bd5e84b1a0ca50c5fbbad9b260fa7\"\n  },\n  \"gate_status\": \"candidate\",\n  \"id2label\": {\n    \"0\": \"easy\",\n    \"1\": \"medium\",\n    \"2\": \"hard\"\n  },\n  \"inference_max_length\": 8192,\n  \"input_contract\": \"structure-preserving-v2\",\n  \"label_rule_version\": \"routerbench-proxy-v1\",\n  \"length_contract_version\": \"train-inference-lengths-v1\",\n  \"model_version\": \"router-synthetic-v1-train512-infer8192\",\n  \"preprocessing_version\": \"routerbench-preprocessing-v1\",\n  \"schema_version\": \"model-package-v1\",\n  \"tokenizer_max_length\": 8192,\n  \"training_max_length\": 512,\n  \"training_version\": \"modernbert-training-v1\"\n}\n",
+        "tokenizer.json": "{\"version\": \"1.0\"}",
+        "tokenizer_config.json": "{}",
+        "training_config.json": "{\"max_length\": 512, \"objective_method\": \"ordinal\", \"input_contract\": \"structure-preserving-v2\"}"
+      }
+    },
+    "v2": {
+      "model_version": "router-synthetic-v2-train512-infer8192",
+      "files": {
+        "config.json": "{\"id2label\": {\"0\": \"low\", \"1\": \"medium\", \"2\": \"high\"}, \"label2id\": {\"low\": 0, \"medium\": 1, \"high\": 2}, \"router_objective\": \"pointwise\", \"max_position_embeddings\": 8192}",
+        "metrics.json": "{\"routerbench\": {\"macro_f1\": 0.81}}",
+        "model.safetensors": "synthetic model weights",
+        "model_manifest.json": "{\n  \"base_model\": \"answerdotai/ModernBERT-base@immutable\",\n  \"checkpoint_config_sha256\": \"250a07d2f7484595acbe23362e114af77f863de374c2e69dbf329bab01e83091\",\n  \"code_commit\": \"0123456789abcdef\",\n  \"created_at\": \"2026-09-26T00:00:00+00:00\",\n  \"dataset_version\": \"routerbench-test-v1\",\n  \"evaluation_version\": \"router-evaluation-v1\",\n  \"files\": {\n    \"config.json\": \"250a07d2f7484595acbe23362e114af77f863de374c2e69dbf329bab01e83091\",\n    \"metrics.json\": \"705160bd821cd855c963ec2387b11e9c5cac014b7d61c4956f6b38971954c41d\",\n    \"model.safetensors\": \"ac09cdebf758dc9030d88cc022b58ead1b50843557d2b459d2231e345c57ce6a\",\n    \"routing_policy.json\": \"02d9557a6aeb60ab41debba36c1b96a25a7075464d5b0597b6afab39d70db849\",\n    \"tokenizer.json\": \"4e3043229142b64d998563bc543ce034e0a2251af5d404995e3afcb8ce8850df\",\n    \"tokenizer_config.json\": \"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\n    \"training_config.json\": \"e6e5f5311482e08c8c2c134048aa1088f8d702265b627c2fa62a039e016ffa38\"\n  },\n  \"gate_status\": \"candidate\",\n  \"id2label\": {\n    \"0\": \"low\",\n    \"1\": \"medium\",\n    \"2\": \"high\"\n  },\n  \"inference_max_length\": 8192,\n  \"input_contract\": \"structure-preserving-v2\",\n  \"label_rule_version\": \"routerbench-proxy-v1\",\n  \"length_contract_version\": \"train-inference-lengths-v1\",\n  \"model_version\": \"router-synthetic-v2-train512-infer8192\",\n  \"objective\": \"pointwise\",\n  \"preprocessing_version\": \"routerbench-preprocessing-v1\",\n  \"routing_policy_file\": \"routing_policy.json\",\n  \"routing_policy_sha256\": \"02d9557a6aeb60ab41debba36c1b96a25a7075464d5b0597b6afab39d70db849\",\n  \"schema_version\": \"model-package-v2\",\n  \"tokenizer_max_length\": 8192,\n  \"training_max_length\": 512,\n  \"training_version\": \"modernbert-training-v1\"\n}\n",
+        "routing_policy.json": "{\"schema_version\": \"routing-policy-v2\", \"scope\": \"service-explicit\", \"policy_version\": \"fixture-policy-v2\", \"objective\": \"pointwise\", \"input_contract\": \"structure-preserving-v2\", \"max_length\": 8192, \"action_order\": [\"low\", \"medium\", \"high\"], \"score_semantics\": \"independent_success_probabilities\", \"lambda_cost\": 0.25, \"candidate_pool\": {\"version\": \"fixture-service-pool-v1\", \"price_version\": \"fixture-prices-v1\", \"decision_cost_version\": \"fixture-pre-request-costs-v1\", \"decision_cost_basis\": \"pre-request-fixed\", \"cost_unit\": \"normalized-0-1\", \"candidates\": [{\"action\": \"low\", \"tier_projection\": \"easy\", \"model\": \"haiku\", \"model_id\": \"fixture-provider/small-model-v1\", \"decision_cost\": 0.0}, {\"action\": \"medium\", \"tier_projection\": \"medium\", \"model\": \"sonnet\", \"model_id\": \"fixture-provider/mid-model-v1\", \"decision_cost\": 0.3}, {\"action\": \"high\", \"tier_projection\": \"hard\", \"model\": \"opus\", \"model_id\": \"fixture-provider/large-model-v1\", \"decision_cost\": 1.0}]}, \"policy_sha256\": \"3a4294af6a02b5c856fddc318735ac321b9bdee51db9022f9a9c381b70e42f2e\", \"length_contract_version\": \"train-inference-lengths-v1\"}",
+        "tokenizer.json": "{\"version\": \"1.0\"}",
+        "tokenizer_config.json": "{}",
+        "training_config.json": "{\"max_length\": 512, \"objective_method\": \"pointwise\", \"input_contract\": \"structure-preserving-v2\"}"
+      }
+    }
+  }
+}

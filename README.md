@@ -36,10 +36,10 @@ flowchart LR
 ```
 
 - Spring: 공개 서비스, pgvector, cache hit/miss 및 threshold, provider 모델 ID와 호출, 피드백 선택·PII 제거·전송 시점을 담당한다.
-- FastAPI: 임베딩·재채점·난이도 추론, inline feedback 검증·Parquet/manifest 생성·GCS 게시·Vertex 제출, 승인 모델 적재를 담당한다.
+- FastAPI: 임베딩·재채점·라우팅 추론, inline feedback 검증·Parquet/manifest 생성·GCS 게시·Vertex 제출, 승인 모델 적재를 담당한다.
 - ML pipeline: 공통 학습 코어, 전처리·학습·평가·gate·package·자동 승격을 담당한다. 코드가 KFP SDK로 작성되어 있어도 실행 대상은 managed Vertex AI Pipelines이며 GKE 운영을 전제하지 않는다.
 
-현재 loader·자동 승격·continual retraining은 ModernBERT 전용이다. [명시적 routing v2](docs/api-contract.md#routing-policy-v2)는 R0/R1/R2 추론과 package 검증을 지원하지만, R1/R2의 online feedback·학습·승격 gate가 완성됐다는 뜻은 아니다. R3 또는 다른 backbone의 연구 checkpoint는 이 계약만으로 적재할 수 없다. 최초 학습과 실제 feedback 실험의 실행 범위는 [ML 명세](../LLM_Router/docs/ml/README.md#retraining)를 따른다.
+현재 loader·자동 승격·continual retraining은 ModernBERT 전용이다. R0·R1은 기존 `/router/classify`의 요청과 `tier`, `model`, `confidence`, `modelVersion` 네 응답 필드를 그대로 사용하며, 명시적 정책이 있으면 양쪽 모두 그 정책으로 후보를 선택한다. [명시적 routing 정책](docs/api-contract.md#routing-policy-v2)은 R0/R1/R2 추론과 package 검증을 지원하지만, R1/R2의 online feedback·학습·승격 gate가 완성됐다는 뜻은 아니다. R3 또는 다른 backbone의 연구 checkpoint는 이 계약만으로 적재할 수 없다. 최초 학습과 실제 feedback 실험의 실행 범위는 [ML 명세](../LLM_Router/docs/ml/README.md#retraining)를 따른다.
 
 ## 로컬 실행
 
@@ -66,7 +66,7 @@ cp .env.example .env
 | 대상 | 현행 기본값·동작 |
 | --- | --- |
 | BGE | `BAAI/bge-large-en-v1.5`, revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`; CLS pooling, L2 정규화, 1,024차원, prefix 없음, 512 token truncation |
-| Router | legacy v1 ordinal은 `easy=0, medium=1, hard=2`와 설정 기본 최대 길이 8,192; 명시적 v2 package는 objective별 label·정책을 검증하고 512토큰 고정 |
+| Router | R0·R1 신규 추론 목표 8,192; 명시적 길이 계약으로 실제 학습 길이와 분리 검증. 기존 v2 512 계약과 legacy v1 설정 호환 유지. [길이 계약](docs/api-contract.md#95-입력-정규화와-학습추론-길이-분리) |
 | Reranker | 기본 비활성; 이미지에 `cross-encoder/quora-distilroberta-base` revision `f62e7a4b20b97195c2868e53ec59126df5eac743` 포함, 최대 길이 512, 기본 후보 16개 |
 | 장치 | `LLM_ROUTER_MODEL_DEVICE=auto`: CUDA 사용 가능 시 CUDA, 아니면 CPU |
 
