@@ -16,6 +16,7 @@ from llm_router_serving.retraining.gcs import (
     FeedbackBatchValidator,
     FeedbackReplayMaterializer,
     MaterializedFeedback,
+    ObjectStore,
     ValidatedFeedbackBatch,
 )
 from llm_router_serving.retraining.observability import (
@@ -26,6 +27,7 @@ from llm_router_serving.retraining.observability import (
 from llm_router_serving.retraining.pipeline import PipelineClient, PipelineState
 from llm_router_serving.retraining.store import (
     ABANDONED_STATUS,
+    ROLLED_BACK_LEDGER_STATUS,
     RetrainingJob,
     RetrainingJobStore,
     VersionPolicyState,
@@ -84,6 +86,7 @@ class EscalationService:
         pipeline_client: PipelineClient,
         materializer: FeedbackReplayMaterializer,
         observability_reader: RetrainingObservabilityReader | None = None,
+        model_pointer_store: ObjectStore | None = None,
     ) -> None:
         self._settings = settings
         self._validator = validator
@@ -91,6 +94,7 @@ class EscalationService:
         self._pipeline_client = pipeline_client
         self._materializer = materializer
         self._observability_reader = observability_reader
+        self._model_pointer_store = model_pointer_store
         self._job_store.get_or_create_version_policy(
             default_mode=settings.retraining_version_policy_mode
         )
@@ -118,6 +122,8 @@ class EscalationService:
             )
         successful_runs = await asyncio.to_thread(self._job_store.list_succeeded)
         plan = self._training_plan(successful_runs)
+        if self._settings.retraining_promotion_mode == "direct":
+            await self._verify_direct_baseline(plan)
         candidate_version = self.candidate_model_version(
             request, logical_model_version=plan.logical_model_version
         )
@@ -409,6 +415,43 @@ class EscalationService:
             initial_model_uri=initial_uri,
         )
 
+    async def _verify_direct_baseline(self, plan: ContinualTrainingPlan) -> None:
+        """Reject a direct submission before Vertex if CURRENT != the ledger baseline.
+
+        Direct promotion binds its evidence to `plan.baseline_model_version`, which
+        is derived from the ledger's last successful run, and the promotion component
+        rejects a mismatch against the actually-published CURRENT pointer only after
+        training completes. A manual `model_publish_cli rollback` of CURRENT (see
+        docs/ml/README.md 5.14) does not update the ledger, so without this check a
+        submission after a manual rollback would run a full GPU training job and then
+        fail at the promotion step. Reconcile the ledger with
+        `RetrainingJobStore.reconcile_manual_rollback` after a manual rollback so this
+        check passes again.
+        """
+        pointer_uri = self._settings.current_model_pointer_uri()
+        if not pointer_uri or self._model_pointer_store is None:
+            raise BatchValidationError(
+                "DIRECT_BASELINE_UNAVAILABLE",
+                "direct promotion requires a configured CURRENT pointer to verify "
+                "the ledger baseline before submission",
+            )
+        try:
+            raw = await asyncio.to_thread(self._model_pointer_store.read_bytes, pointer_uri)
+            payload = json.loads(raw)
+            current_model_version = str(payload["model_version"])
+        except (json.JSONDecodeError, KeyError, TypeError, UnicodeDecodeError) as exc:
+            raise BatchValidationError(
+                "DIRECT_BASELINE_UNAVAILABLE",
+                f"could not parse CURRENT.json to verify the direct baseline: {exc}",
+            ) from exc
+        if current_model_version != plan.baseline_model_version:
+            raise BatchValidationError(
+                "DIRECT_BASELINE_MISMATCH",
+                f"ledger baseline {plan.baseline_model_version!r} does not match "
+                f"published CURRENT {current_model_version!r}; reconcile the "
+                "retraining ledger after a manual CURRENT rollback before resubmitting",
+            )
+
     async def status(
         self,
         batch_id: str,
@@ -592,6 +635,11 @@ class EscalationService:
             "rejected": RetrainingOverallStatus.REJECTED,
             "failed": RetrainingOverallStatus.FAILED,
             "cancelled": RetrainingOverallStatus.CANCELLED,
+            # A succeeded direct-promotion run manually excluded from ledger
+            # planning after its CURRENT pointer was rolled back; it trained and
+            # published successfully, so REJECTED/FAILED would misstate the
+            # outcome, but it is no longer the plan-relevant successful run.
+            ROLLED_BACK_LEDGER_STATUS: RetrainingOverallStatus.CANCELLED,
         }
         return mapping.get(value, RetrainingOverallStatus.UNKNOWN)
 

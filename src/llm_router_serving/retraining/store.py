@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
+
+logger = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = ("submitting", "submitted", "running", "pending", "canceling", "paused")
 
@@ -12,6 +15,11 @@ ACTIVE_STATUSES = ("submitting", "submitted", "running", "pending", "canceling",
 # process died before recording the run ID. `abandoned` releases such a lease
 # once the service has reconciled it against Vertex.
 ABANDONED_STATUS = "abandoned"
+
+# A succeeded direct-promotion run whose CURRENT pointer was manually rolled
+# back outside the ledger (see RetrainingJobStore.reconcile_manual_rollback).
+# Distinct from `cancelled`, which means Vertex itself cancelled the run.
+ROLLED_BACK_LEDGER_STATUS = "rolled_back"
 
 _COLUMNS = (
     "batch_id, request_fingerprint, pipeline_run_id, status, created_at, updated_at, "
@@ -60,6 +68,14 @@ class RetrainingInProgressError(RuntimeError):
 
 class VersionPolicyRevisionConflictError(RuntimeError):
     pass
+
+
+class LedgerBatchNotFoundError(RuntimeError):
+    pass
+
+
+class LedgerReconciliationError(RuntimeError):
+    """Raised when a manual-rollback reconciliation cannot be applied as requested."""
 
 
 @dataclass(frozen=True)
@@ -321,6 +337,50 @@ class RetrainingJobStore:
                     "updated_at = CURRENT_TIMESTAMP WHERE batch_id = ?",
                     (status, status, batch_id),
                 )
+
+    def reconcile_manual_rollback(self, *, batch_id: str, reason: str) -> RetrainingJob:
+        """Exclude a succeeded run from ledger planning after a manual CURRENT rollback.
+
+        The training-plan trigger (`build_continual_training_plan`) counts rows with
+        `status = 'succeeded'` and reads the most recent one for the next baseline and
+        anchor. A manual `model_publish_cli rollback` of CURRENT does not touch this
+        table, so an untouched ledger keeps planning against a baseline that no longer
+        matches the published CURRENT pointer — the next direct-promotion run then
+        fails only after training completes (`CURRENT differs from direct baseline`).
+
+        This only transitions a row that is currently `succeeded`, so it cannot hide
+        an active or already-terminal run, and it is intentionally distinct from
+        `cancelled` (which means Vertex itself cancelled the pipeline).
+        """
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                f"SELECT {_COLUMNS} FROM retraining_jobs WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if existing is None:
+                raise LedgerBatchNotFoundError(batch_id)
+            job = self._to_job(existing)
+            if job.status != "succeeded":
+                raise LedgerReconciliationError(
+                    f"batch {batch_id!r} is not in 'succeeded' status "
+                    f"(found {job.status!r}); nothing changed"
+                )
+            connection.execute(
+                "UPDATE retraining_jobs SET status = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE batch_id = ?",
+                (ROLLED_BACK_LEDGER_STATUS, batch_id),
+            )
+            updated = connection.execute(
+                f"SELECT {_COLUMNS} FROM retraining_jobs WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        logger.warning(
+            "Reconciled ledger for batch %s after manual CURRENT rollback: %s",
+            batch_id,
+            reason,
+        )
+        return self._to_job(updated)
 
     def get_or_create_version_policy(
         self, *, default_mode: str, actor: str = "configuration"
