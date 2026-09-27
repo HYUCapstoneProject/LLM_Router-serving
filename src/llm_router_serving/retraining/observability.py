@@ -117,6 +117,7 @@ class RetrainingObservabilityReader:
         candidate_model_version: str,
         pipeline_run_id: str,
         publish_root_uri: str,
+        promotion_mode: str = "quality_gate",
     ) -> None:
         """Verify an explicitly supported promotion independently of Vertex state.
 
@@ -147,8 +148,11 @@ class RetrainingObservabilityReader:
             re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", candidate_model_version) is not None,
             "candidate version is not a safe path segment",
         )
+        require(promotion_mode in {"quality_gate", "direct"}, "unsupported promotion mode")
+        direct = promotion_mode == "direct"
         run_root = self.run_root(batch_id)
-        gate_raw, gate = read_object(f"{run_root}/gate/gate-result.json", "gate evidence")
+        evidence_path = "promotion/direct-result.json" if direct else "gate/gate-result.json"
+        gate_raw, gate = read_object(f"{run_root}/{evidence_path}", "promotion evidence")
         _, publish = read_object(f"{run_root}/result/publish-result.json", "publish evidence")
         for name, value in (("gate", gate), ("publish", publish)):
             require(value.get("batch_id") == batch_id, f"{name} batch mismatch")
@@ -171,13 +175,26 @@ class RetrainingObservabilityReader:
             else ("ordinal", "model-package-v1", "deploy-gate-result-v1")
         )
         require(
-            contract in SUPPORTED_PROMOTION_CONTRACTS,
+            contract
+            in (
+                {("ordinal", "model-package-v1", "direct-promotion-result-v1")}
+                if direct
+                else SUPPORTED_PROMOTION_CONTRACTS
+            ),
             "objective/package/gate contract is unsupported",
         )
         require(
             gate.get("schema_version") == "retraining-observability-v1"
             and gate.get("source_schema_version") == contract[2]
-            and gate.get("passed") is True,
+            and (
+                (
+                    "passed" not in gate
+                    and gate.get("promotion_mode") == "direct"
+                    and gate.get("quality_gate_skipped") is True
+                )
+                if direct
+                else gate.get("passed") is True
+            ),
             "gate approval is unverified",
         )
         require(
@@ -254,20 +271,62 @@ class RetrainingObservabilityReader:
                     ),
                     "promotion inference length contract differs from package",
                 )
-            metrics_sha = publish.get("candidate_metrics_sha256")
-            metric_name = {
-                "continual_gate": "gate_metrics.json",
-                "routerarena": "routerarena_metrics.json",
-                "development_calibration": "development_metrics.json",
-            }.get(manifest.get("evaluation_role", "routerarena"))
-            require(
-                isinstance(metrics_sha, str)
-                and re.fullmatch(r"[0-9a-f]{64}", metrics_sha) is not None
-                and gate.get("candidate_metrics_sha256") == metrics_sha
-                and isinstance(manifest.get("files"), dict)
-                and manifest["files"].get(metric_name) == metrics_sha,
-                "approved package does not bind the gated evaluation",
-            )
+            if direct:
+                require(
+                    all(
+                        value.get("promotion_mode") == "direct"
+                        and value.get("quality_gate_skipped") is True
+                        for value in (gate, publish, manifest)
+                    )
+                    and manifest.get("length_contract_version") == "train-inference-lengths-v1"
+                    and type(manifest.get("inference_max_length")) is int
+                    and manifest["inference_max_length"] == 8192
+                    and "passed" not in publish
+                    and gate.get("candidate_metrics_sha256") is None
+                    and publish.get("candidate_metrics_sha256") is None
+                    and manifest.get("evaluation_role") == "not_evaluated"
+                    and manifest.get("evaluation_version") == "not-evaluated-direct-promotion-v1"
+                    and isinstance(manifest.get("files"), dict)
+                    and not {
+                        "gate_metrics.json",
+                        "routerarena_metrics.json",
+                        "development_metrics.json",
+                    }.intersection(manifest["files"]),
+                    "direct promotion must not claim a quality evaluation",
+                )
+                baseline_sha = gate.get("baseline_manifest_sha256")
+                require(
+                    isinstance(baseline_sha, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", baseline_sha) is not None
+                    and publish.get("baseline_manifest_sha256") == baseline_sha
+                    and publish.get("baseline_model_version") == gate.get("baseline_model_version")
+                    and publish.get("expected_current_generation")
+                    == gate.get("expected_current_generation")
+                    and gate.get("model_publish_root_uri") == root
+                    and isinstance(gate.get("baseline_model_version"), str)
+                    and bool(gate["baseline_model_version"])
+                    and pointer.get("previous_model_version") == gate["baseline_model_version"]
+                    and type(gate.get("expected_current_generation")) is int
+                    and gate["expected_current_generation"] > 0
+                    and pointer.get("previous_pointer_generation")
+                    == gate["expected_current_generation"],
+                    "direct promotion baseline binding mismatch",
+                )
+            else:
+                metrics_sha = publish.get("candidate_metrics_sha256")
+                metric_name = {
+                    "continual_gate": "gate_metrics.json",
+                    "routerarena": "routerarena_metrics.json",
+                    "development_calibration": "development_metrics.json",
+                }.get(manifest.get("evaluation_role", "routerarena"))
+                require(
+                    isinstance(metrics_sha, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", metrics_sha) is not None
+                    and gate.get("candidate_metrics_sha256") == metrics_sha
+                    and isinstance(manifest.get("files"), dict)
+                    and manifest["files"].get(metric_name) == metrics_sha,
+                    "approved package does not bind the gated evaluation",
+                )
             generation = publish.get("current_pointer_generation")
             require(
                 type(generation) is int and generation > 0, "CURRENT generation evidence missing"

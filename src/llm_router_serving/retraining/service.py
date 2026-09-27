@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 from llm_router_serving.config import Settings
 from llm_router_serving.retraining.gcs import (
+    BatchValidationError,
     FeedbackBatchValidator,
     FeedbackReplayMaterializer,
     MaterializedFeedback,
@@ -106,6 +107,15 @@ class EscalationService:
             self._job_store.get_or_create_version_policy,
             default_mode=self._settings.retraining_version_policy_mode,
         )
+        if self._settings.retraining_promotion_mode == "direct" and (
+            policy.mode != "successfulHttpRequest"
+            or policy.pending_mode not in {None, "successfulHttpRequest"}
+        ):
+            raise BatchValidationError(
+                "UNSUPPORTED_PROMOTION_POLICY",
+                "direct promotion requires successfulHttpRequest "
+                "with no incompatible pending policy",
+            )
         successful_runs = await asyncio.to_thread(self._job_store.list_succeeded)
         plan = self._training_plan(successful_runs)
         candidate_version = self.candidate_model_version(
@@ -120,6 +130,7 @@ class EscalationService:
             training_mode=plan.training_mode.value,
             initialization_mode=plan.initialization_mode.value,
             version_policy_mode=policy.mode,
+            promotion_mode=self._settings.retraining_promotion_mode,
             canonical_batch_digest=self._canonical_batch_digest(request),
             base_model_version=plan.anchor_model_version,
             base_model_uri=plan.anchor_model_uri,
@@ -204,6 +215,7 @@ class EscalationService:
                 candidate_model_version=job.candidate_model_version or "",
                 pipeline_run_id=job.pipeline_run_id,
                 publish_root_uri=self._settings.model_publish_root_uri or "",
+                promotion_mode=job.promotion_mode,
             )
             await asyncio.to_thread(
                 self._job_store.mark_status,
@@ -343,6 +355,8 @@ class EscalationService:
                 else plan.anchor_model_version
             ),
         }
+        if settings.retraining_promotion_mode == "direct":
+            arguments["promotion_mode"] = "direct"
         # Without these the compiled IR falls back to its own defaults, which
         # would silently run the CustomJob as the default compute service account.
         optional = {
@@ -433,7 +447,8 @@ class EscalationService:
             and observed.feedback_prepare.get("failure_code") == "NO_UNIQUE_FEEDBACK"
         )
         gate_rejection = (
-            observed.gate
+            job.promotion_mode == "quality_gate"
+            and observed.gate
             and observed.gate.get("passed") is False
             and observed.gate.get("candidate_model_version") == job.candidate_model_version
             and observed.gate.get("pipeline_job_resource_name") == job.pipeline_run_id
@@ -471,7 +486,7 @@ class EscalationService:
             pipelineRunId=job.pipeline_run_id,
             status=overall,
             terminal=terminal,
-            stage=self._current_stage(overall, observed),
+            stage=self._current_stage(overall, observed, promotion_mode=job.promotion_mode),
             version=TrainingVersion(
                 logicalModelVersion=job.logical_model_version or "0.0",
                 candidateModelVersion=job.candidate_model_version or "unknown",
@@ -484,7 +499,12 @@ class EscalationService:
                 ),
             ),
             stageProgress=self._stage_progress(observed.training_progress),
-            stages=self._stages(overall, observed=observed, timestamp=job.ended_at),
+            stages=self._stages(
+                overall,
+                observed=observed,
+                timestamp=job.ended_at,
+                promotion_mode=job.promotion_mode,
+            ),
             filtering=self._filtering_metrics(observed.feedback_prepare),
             merge=self._merge_metrics(observed.feedback_merge),
             result=result,
@@ -581,6 +601,7 @@ class EscalationService:
         *,
         observed: ObservabilitySnapshot,
         timestamp: datetime | None,
+        promotion_mode: str = "quality_gate",
     ) -> list[StageRecord]:
         stages = (
             (RetrainingStageName.FEEDBACK_PREPARATION, observed.feedback_prepare),
@@ -595,7 +616,12 @@ class EscalationService:
             return [
                 StageRecord(
                     name=name,
-                    status=StageExecutionStatus.SUCCEEDED,
+                    status=(
+                        StageExecutionStatus.SKIPPED
+                        if promotion_mode == "direct"
+                        and name in {RetrainingStageName.EVALUATION, RetrainingStageName.GATE}
+                        else StageExecutionStatus.SUCCEEDED
+                    ),
                     startedAt=None,
                     endedAt=timestamp,
                 )
@@ -605,7 +631,12 @@ class EscalationService:
         terminal_failure_seen = False
         for name, artifact in stages:
             state = StageExecutionStatus.PENDING
-            if artifact is not None:
+            if promotion_mode == "direct" and name in {
+                RetrainingStageName.EVALUATION,
+                RetrainingStageName.GATE,
+            }:
+                state = StageExecutionStatus.SKIPPED
+            elif artifact is not None:
                 state = StageExecutionStatus.SUCCEEDED
                 if (
                     name is RetrainingStageName.FEEDBACK_PREPARATION
@@ -643,7 +674,7 @@ class EscalationService:
                 outcome=RetrainingOutcome.PROMOTED,
                 candidateModelVersion=job.candidate_model_version or "unknown",
                 logicalModelVersion=job.logical_model_version or "0.0",
-                gatePassed=True,
+                gatePassed=None if job.promotion_mode == "direct" else True,
                 failedGateChecks=[],
                 failureCode=None,
                 failureStage=None,
@@ -767,7 +798,10 @@ class EscalationService:
 
     @staticmethod
     def _current_stage(
-        overall: RetrainingOverallStatus, observed: ObservabilitySnapshot
+        overall: RetrainingOverallStatus,
+        observed: ObservabilitySnapshot,
+        *,
+        promotion_mode: str = "quality_gate",
     ) -> RetrainingStageName:
         if overall in {
             RetrainingOverallStatus.SUCCEEDED,
@@ -788,6 +822,11 @@ class EscalationService:
             (RetrainingStageName.PUBLISHING, observed.publishing),
         )
         for name, value in ordered:
+            if promotion_mode == "direct" and name in {
+                RetrainingStageName.EVALUATION,
+                RetrainingStageName.GATE,
+            }:
+                continue
             if value is None:
                 return name
         return RetrainingStageName.INITIALIZING

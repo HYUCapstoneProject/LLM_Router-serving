@@ -96,6 +96,7 @@ class Settings(BaseSettings):
     routerarena_dataset_uri: str | None = None
     evaluation_config_uri: str | None = None
     package_metadata_uri: str | None = None
+    retraining_promotion_mode: Literal["quality_gate", "direct"] = "quality_gate"
     baseline_metrics_uri: str | None = None
     model_evaluation_metrics_filename: Literal["routerarena_metrics.json", "gate_metrics.json"] = (
         "routerarena_metrics.json"
@@ -188,6 +189,11 @@ class Settings(BaseSettings):
             and not self.retraining_control_root_uri
         ):
             missing.append("retraining_control_root_uri")
+        if (
+            self.retraining_promotion_mode == "direct"
+            and self.retraining_version_policy_mode != "successfulHttpRequest"
+        ):
+            missing.append("direct promotion requires successfulHttpRequest version policy")
         if self.retraining_calls_per_major != 3:
             missing.append("retraining_calls_per_major(must currently equal 3)")
         if self.retraining_initial_logical_major < 0:

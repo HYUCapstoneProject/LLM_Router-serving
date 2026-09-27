@@ -1225,3 +1225,88 @@ async def test_current_changes_during_verification_preserves_active_lease(tmp_pa
     assert response.stale and not response.terminal and response.result is None
     assert any("CURRENT changed" in message for message in response.warnings)
     assert service._job_store.list_succeeded() == []
+
+
+@pytest.mark.asyncio
+async def test_promotion_mode_is_opt_in_and_persisted_per_run(tmp_path):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    assert "promotion_mode" not in pipeline.submissions[-1][1]
+    assert service._job_store.get(request.batchId).promotion_mode == "quality_gate"
+    service._settings.retraining_promotion_mode = "direct"
+    complete_promotion(service, pipeline, accepted)
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.result.gatePassed is True
+    second = build_request("direct-second")
+    await service.submit(second)
+    assert pipeline.submissions[-1][1]["promotion_mode"] == "direct"
+    assert service._job_store.get(second.batchId).promotion_mode == "direct"
+    reopened = RetrainingJobStore(service._settings.retraining_db_path)
+    assert reopened.get(request.batchId).promotion_mode == "quality_gate"
+    assert reopened.get(second.batchId).promotion_mode == "direct"
+
+
+def test_legacy_database_migration_preserves_quality_gate_mode(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "CREATE TABLE retraining_jobs (batch_id TEXT PRIMARY KEY, "
+            "request_fingerprint TEXT NOT NULL, pipeline_run_id TEXT, status TEXT NOT NULL, "
+            "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, "
+            "updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        )
+        db.execute(
+            "INSERT INTO retraining_jobs(batch_id,request_fingerprint,status) "
+            "VALUES ('old','fingerprint','failed')"
+        )
+    store = RetrainingJobStore(path)
+    assert store.get("old").promotion_mode == "quality_gate"
+    assert store.get("old").status == "failed"
+
+
+def test_direct_status_skips_quality_stages_without_claiming_pass():
+    from llm_router_serving.retraining.observability import ObservabilitySnapshot
+    from llm_router_serving.retraining.store import RetrainingJob
+    from llm_router_serving.schemas import RetrainingOverallStatus
+
+    observed = ObservabilitySnapshot(None, None, None, {"done": True}, None, None, None, None, ())
+    job = RetrainingJob("batch", "fp", "pipeline", "succeeded", promotion_mode="direct")
+    outcome = EscalationService._result(job, RetrainingOverallStatus.SUCCEEDED, observed=observed)
+    assert outcome.gatePassed is None and outcome.outcome == "promoted"
+    stages = EscalationService._stages(
+        RetrainingOverallStatus.SUCCEEDED,
+        observed=observed,
+        timestamp=None,
+        promotion_mode="direct",
+    )
+    assert {str(stage.name): str(stage.status) for stage in stages}["evaluation"] == "skipped"
+    assert {str(stage.name): str(stage.status) for stage in stages}["gate"] == "skipped"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+async def test_direct_incompatible_version_policy_rejected_before_claim(tmp_path, pending):
+    from llm_router_serving.retraining.gcs import BatchValidationError
+
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    service._settings.retraining_promotion_mode = "direct"
+    policy = service._job_store.get_or_create_version_policy(default_mode="successfulHttpRequest")
+    service.schedule_version_policy(
+        expected_revision=policy.revision,
+        mode="validatedUniqueBatch",
+        actor="test",
+        reason="incompatible with direct",
+    )
+    if not pending:
+        service._job_store.activate_pending_version_policy()
+    with pytest.raises(BatchValidationError, match="requires successfulHttpRequest"):
+        await service.submit(request)
+    assert pipeline.submissions == []
+    assert service._job_store.get(request.batchId) is None
