@@ -186,3 +186,19 @@ def test_escalate_rejects_an_empty_event_batch(client, auth_headers):
 
     assert response.status_code == 422
     assert response.json()["code"] == "REQUEST_VALIDATION_FAILED"
+
+
+def test_explicit_inference_threads_are_applied_at_startup(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+
+    from llm_router_serving.config import Settings
+
+    calls = []
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(set_num_threads=calls.append))
+    app = create_app(settings=Settings(
+        _env_file=None, load_models_on_startup=False, model_num_threads=2
+    ))
+    assert calls == []
+    with TestClient(app):
+        assert calls == [2]

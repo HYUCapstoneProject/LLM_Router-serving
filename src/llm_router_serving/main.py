@@ -389,6 +389,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        if settings.model_num_threads is not None:
+            import torch
+
+            # Set before loaders or inference work begin; environment defaults can
+            # differ from the effective PyTorch thread count on the serving host.
+            torch.set_num_threads(settings.model_num_threads)
         load_task: asyncio.Task[None] | None = None
         watcher_task: asyncio.Task[None] | None = None
         if settings.load_models_on_startup:
