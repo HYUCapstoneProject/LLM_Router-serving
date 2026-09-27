@@ -28,6 +28,8 @@ from llm_router_serving.retraining.pipeline import (
 from llm_router_serving.retraining.service import EscalationService
 from llm_router_serving.retraining.store import (
     BatchIdConflictError,
+    LedgerBatchNotFoundError,
+    LedgerReconciliationError,
     RetrainingInProgressError,
     RetrainingJobStore,
     VersionPolicyRevisionConflictError,
@@ -166,6 +168,7 @@ def build_service(tmp_path, request: EscalateRequest):
             root_uri="gs://llm-router/derived",
             rows_per_label=2,
         ),
+        model_pointer_store=store,
     )
     return service, pipeline
 
@@ -1250,6 +1253,146 @@ async def test_promotion_mode_is_opt_in_and_persisted_per_run(tmp_path):
     reopened = RetrainingJobStore(service._settings.retraining_db_path)
     assert reopened.get(request.batchId).promotion_mode == "quality_gate"
     assert reopened.get(second.batchId).promotion_mode == "direct"
+
+
+@pytest.mark.asyncio
+async def test_direct_submit_rejects_when_current_differs_from_ledger_baseline(tmp_path):
+    """A manual CURRENT rollback that outpaces the ledger must not reach Vertex.
+
+    Without this guard the mismatch is only caught by the promotion component
+    after a full (GPU, in production) training job, wasting the run.
+    """
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    service._settings.retraining_promotion_mode = "direct"
+    complete_promotion(service, pipeline, accepted)
+
+    store = service._observability_reader._object_store
+    pointer_uri = service._settings.model_publish_root_uri + "/CURRENT.json"
+    store.objects[pointer_uri] = json.dumps(
+        {"schema_version": "router-current-model-v1", "model_version": "rolled-back-to-1.0"}
+    ).encode()
+
+    second = build_request("direct-baseline-mismatch")
+    with pytest.raises(BatchValidationError) as error:
+        await service.submit(second)
+    assert error.value.code == "DIRECT_BASELINE_MISMATCH"
+    assert pipeline.submissions[-1][0] != f"retrain-{second.batchId}"
+    assert service._job_store.get(second.batchId) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_submit_rejects_when_current_pointer_is_unreadable(tmp_path):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    service._settings.retraining_promotion_mode = "direct"
+    complete_promotion(service, pipeline, accepted)
+
+    store = service._observability_reader._object_store
+    pointer_uri = service._settings.model_publish_root_uri + "/CURRENT.json"
+    store.objects[pointer_uri] = b"not json"
+
+    second = build_request("direct-baseline-unreadable")
+    with pytest.raises(BatchValidationError) as error:
+        await service.submit(second)
+    assert error.value.code == "DIRECT_BASELINE_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_direct_submit_succeeds_when_ledger_matches_current(tmp_path):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    service._settings.retraining_promotion_mode = "direct"
+    complete_promotion(service, pipeline, accepted)
+
+    second = build_request("direct-baseline-match")
+    accepted_second = await service.submit(second)
+    assert accepted_second.pipeline_run_id
+
+
+@pytest.mark.asyncio
+async def test_reconcile_manual_rollback_excludes_run_from_ledger_planning(tmp_path):
+    request = build_request()
+    service, pipeline = build_service(tmp_path, request)
+    accepted = await service.submit(request)
+    complete_promotion(service, pipeline, accepted)
+    await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert len(service._job_store.list_succeeded()) == 1
+
+    updated = service._job_store.reconcile_manual_rollback(
+        batch_id=request.batchId, reason="test manual CURRENT rollback"
+    )
+    assert updated.status == "rolled_back"
+    assert service._job_store.list_succeeded() == []
+    # A second reconciliation of the same batch must not silently succeed.
+    with pytest.raises(LedgerReconciliationError):
+        service._job_store.reconcile_manual_rollback(
+            batch_id=request.batchId, reason="retry"
+        )
+
+    # The run trained and published successfully; it must not read as rejected
+    # or failed, but it is also no longer the ledger's plan-relevant success.
+    response = await service.status(
+        request.batchId,
+        serving_model_version="old",
+        desired_model_version=None,
+        desired_load_error=None,
+    )
+    assert response.status == "cancelled"
+
+
+def test_reconcile_manual_rollback_rejects_unknown_batch(tmp_path):
+    service, _ = build_service(tmp_path, build_request())
+    with pytest.raises(LedgerBatchNotFoundError):
+        service._job_store.reconcile_manual_rollback(
+            batch_id="does-not-exist", reason="test"
+        )
+
+
+def test_ledger_cli_reconciles_and_reports_result(tmp_path, capsys):
+    from llm_router_serving.retraining.ledger_cli import main as ledger_cli_main
+
+    db_path = tmp_path / "retraining.sqlite3"
+    store = RetrainingJobStore(db_path)
+    store.claim(
+        batch_id="batch-1",
+        request_fingerprint="fp",
+        logical_model_version="1.1",
+        candidate_model_version="router-modernbert-feedback-v1.1-x",
+        training_mode="minor_fine_tune",
+        promotion_mode="direct",
+    )
+    store.mark_submitted(batch_id="batch-1", pipeline_run_id="run-1")
+    store.mark_status(batch_id="batch-1", status="succeeded")
+
+    exit_code = ledger_cli_main(
+        ["--db-path", str(db_path), "--batch-id", "batch-1", "--reason", "test rollback"]
+    )
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "rolled_back"
+    assert output["promotion_mode"] == "direct"
+    assert RetrainingJobStore(db_path).list_succeeded() == []
+
+
+def test_ledger_cli_reports_unknown_batch_on_stderr(tmp_path, capsys):
+    from llm_router_serving.retraining.ledger_cli import main as ledger_cli_main
+
+    db_path = tmp_path / "retraining.sqlite3"
+    RetrainingJobStore(db_path)
+    exit_code = ledger_cli_main(
+        ["--db-path", str(db_path), "--batch-id", "missing", "--reason", "test"]
+    )
+    assert exit_code == 1
+    assert "missing" in capsys.readouterr().err
 
 
 def test_legacy_database_migration_preserves_quality_gate_mode(tmp_path):

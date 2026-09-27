@@ -295,6 +295,9 @@ def _build_escalation_service(settings: Settings) -> EscalationService | None:
             if settings.retraining_observability_root_uri
             else None
         ),
+        # Direct promotion verifies the ledger baseline against the actually
+        # published CURRENT pointer before submitting to Vertex.
+        model_pointer_store=object_store,
     )
 
 
