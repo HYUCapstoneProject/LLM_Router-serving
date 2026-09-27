@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from llm_router_serving.config import Settings
 
 
@@ -83,3 +86,15 @@ def test_router_model_version_accepts_feedback_batch_digest():
     )
 
     assert settings.router_model_version.endswith("acde1234-21c2f1b")
+
+
+@pytest.mark.parametrize("release", ["v1", "v12"])
+def test_router_model_version_accepts_initial_release(release):
+    version = f"router-modernbert-r0-a-20260927-{release}"
+    assert Settings(_env_file=None, router_model_version=version).router_model_version == version
+
+
+@pytest.mark.parametrize("release", ["v0", "v01", "v-1", "v1suffix", "v1/approved", "latest"])
+def test_router_model_version_rejects_malformed_initial_release(release):
+    with pytest.raises(ValidationError, match="router_model_version must follow"):
+        Settings(_env_file=None, router_model_version=f"router-modernbert-r0-a-20260927-{release}")

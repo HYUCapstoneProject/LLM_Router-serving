@@ -263,12 +263,13 @@ class Settings(BaseSettings):
     @classmethod
     def validate_router_model_version(cls, value: str | None) -> str | None:
         if value is not None and not re.fullmatch(
-            r"router-[a-z0-9._-]+-\d{8}(?:-[0-9a-fA-F]{8})?-[0-9a-fA-F]{7,40}",
+            r"router-[a-z0-9._-]+-\d{8}(?:(?:-[0-9a-fA-F]{8})?-[0-9a-fA-F]{7,40}|-v[1-9][0-9]*)",
             value,
         ):
             raise ValueError(
                 "router_model_version must follow router-{model}-{dataset}-{date}-"
-                "[{batchDigest}-]{shortCommit}"
+                "[{batchDigest}-]{shortCommit} or "
+                "router-{model}-{dataset}-{date}-v{positiveInteger}"
             )
         return value
 
