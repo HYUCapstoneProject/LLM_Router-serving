@@ -104,3 +104,10 @@ def test_router_model_version_rejects_malformed_initial_release(release):
 def test_inference_threads_reject_out_of_range_values(threads):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, model_num_threads=threads)
+
+
+def test_promotion_mode_requires_explicit_supported_value():
+    assert Settings().retraining_promotion_mode == "quality_gate"
+    assert Settings(retraining_promotion_mode="direct").retraining_promotion_mode == "direct"
+    with pytest.raises(ValidationError):
+        Settings(retraining_promotion_mode="skip")

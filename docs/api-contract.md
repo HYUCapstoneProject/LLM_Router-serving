@@ -560,3 +560,31 @@ D_dev의 비교 승자 선정, 모델 파일 보관, sealed test 진단, 서비�
 [classifier](../src/llm_router_serving/inference.py),
 [HTTP endpoint](../src/llm_router_serving/main.py),
 [v2 계약 테스트](../tests/test_routing_policy_v2.py).
+
+### Explicit direct promotion
+
+`LLM_ROUTER_RETRAINING_PROMOTION_MODE=direct` opts new runs into direct promotion.
+The default `quality_gate` keeps the existing evaluation and gate contract; the
+parameter is omitted for older compiled pipeline compatibility. Each run stores
+its selected mode in SQLite. Existing rows migrate to `quality_gate`, so changing
+the server setting never reinterprets historical runs.
+
+Direct runs skip pre-promotion quality evaluation and the quality gate. Their
+existing status response reports `evaluation` and `gate` stages as `skipped`,
+`result.gatePassed: null`, and `outcome: promoted` only after verified publishing.
+This does not establish improved model quality. No fabricated evaluation metrics
+or passing gate result is produced. API request and response shapes are unchanged.
+
+Success still requires separate `direct-promotion-result-v1` evidence under
+`promotion/direct-result.json`, bound to the batch, pipeline job, candidate,
+package hashes, prior model and CURRENT generation. The publisher's evidence,
+approved manifest and CURRENT pointer must agree. Missing or mismatched evidence
+keeps the run pending/stale and does not advance the success counter. Activation
+continues to use the existing model loading flow. Direct packages have no evaluation
+metrics; switching back to quality-gated promotion requires a real evaluation of
+the baseline, not placeholder metrics.
+
+Direct mode currently supports the `successfulHttpRequest` version policy only.
+An incompatible active or pending policy rejects a new submission with HTTP 422
+`UNSUPPORTED_PROMOTION_POLICY` before a lease or Vertex job is created. Three
+verified promotions still advance the existing major-cycle policy.

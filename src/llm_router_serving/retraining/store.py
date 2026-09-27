@@ -17,7 +17,7 @@ _COLUMNS = (
     "batch_id, request_fingerprint, pipeline_run_id, status, created_at, updated_at, "
     "submitted_at, started_at, ended_at, "
     "logical_model_version, candidate_model_version, training_mode, "
-    "initialization_mode, version_policy_mode, canonical_batch_digest, "
+    "initialization_mode, version_policy_mode, promotion_mode, canonical_batch_digest, "
     "base_model_version, base_model_uri, "
     "feedback_manifest_uri, feedback_events_uri, replay_manifest_uri, "
     "replay_events_uri"
@@ -40,6 +40,7 @@ class RetrainingJob:
     training_mode: str | None = None
     initialization_mode: str | None = None
     version_policy_mode: str | None = None
+    promotion_mode: str = "quality_gate"
     canonical_batch_digest: str | None = None
     base_model_version: str | None = None
     base_model_uri: str | None = None
@@ -108,6 +109,7 @@ class RetrainingJobStore:
                 "training_mode": "TEXT",
                 "initialization_mode": "TEXT",
                 "version_policy_mode": "TEXT",
+                "promotion_mode": "TEXT NOT NULL DEFAULT 'quality_gate'",
                 "canonical_batch_digest": "TEXT",
                 "base_model_version": "TEXT",
                 "base_model_uri": "TEXT",
@@ -186,6 +188,7 @@ class RetrainingJobStore:
         training_mode: str | None = None,
         initialization_mode: str | None = None,
         version_policy_mode: str | None = None,
+        promotion_mode: str = "quality_gate",
         canonical_batch_digest: str | None = None,
         base_model_version: str | None = None,
         base_model_uri: str | None = None,
@@ -212,7 +215,7 @@ class RetrainingJobStore:
                     "UPDATE retraining_jobs SET status = 'submitting', "
                     "logical_model_version = ?, candidate_model_version = ?, "
                     "training_mode = ?, initialization_mode = ?, base_model_version = ?, "
-                    "version_policy_mode = ?, canonical_batch_digest = ?, "
+                    "version_policy_mode = ?, promotion_mode = ?, canonical_batch_digest = ?, "
                     "base_model_uri = ?, feedback_manifest_uri = NULL, "
                     "feedback_events_uri = NULL, replay_manifest_uri = NULL, "
                     "replay_events_uri = NULL, updated_at = CURRENT_TIMESTAMP "
@@ -224,6 +227,7 @@ class RetrainingJobStore:
                         initialization_mode,
                         base_model_version,
                         version_policy_mode,
+                        promotion_mode,
                         canonical_batch_digest,
                         base_model_uri,
                         batch_id,
@@ -242,10 +246,10 @@ class RetrainingJobStore:
                 "INSERT INTO retraining_jobs "
                 "(batch_id, request_fingerprint, status, logical_model_version, "
                 "candidate_model_version, training_mode, initialization_mode, "
-                "version_policy_mode, canonical_batch_digest, "
+                "version_policy_mode, promotion_mode, canonical_batch_digest, "
                 "base_model_version, base_model_uri, feedback_manifest_uri, "
                 "feedback_events_uri, replay_manifest_uri, replay_events_uri) "
-                "VALUES (?, ?, 'submitting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, 'submitting', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     batch_id,
                     request_fingerprint,
@@ -254,6 +258,7 @@ class RetrainingJobStore:
                     training_mode,
                     initialization_mode,
                     version_policy_mode,
+                    promotion_mode,
                     canonical_batch_digest,
                     base_model_version,
                     base_model_uri,
@@ -448,6 +453,7 @@ class RetrainingJobStore:
             training_mode=_optional_text(row["training_mode"]),
             initialization_mode=_optional_text(row["initialization_mode"]),
             version_policy_mode=_optional_text(row["version_policy_mode"]),
+            promotion_mode=str(row["promotion_mode"] or "quality_gate"),
             canonical_batch_digest=_optional_text(row["canonical_batch_digest"]),
             base_model_version=_optional_text(row["base_model_version"]),
             base_model_uri=_optional_text(row["base_model_uri"]),
