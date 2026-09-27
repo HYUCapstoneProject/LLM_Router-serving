@@ -98,3 +98,9 @@ def test_router_model_version_accepts_initial_release(release):
 def test_router_model_version_rejects_malformed_initial_release(release):
     with pytest.raises(ValidationError, match="router_model_version must follow"):
         Settings(_env_file=None, router_model_version=f"router-modernbert-r0-a-20260927-{release}")
+
+
+@pytest.mark.parametrize("threads", [0, -1, 33])
+def test_inference_threads_reject_out_of_range_values(threads):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, model_num_threads=threads)

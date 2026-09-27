@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     router_max_length: int = 8192
     router_profile: Literal["legacy", "r0"] = "legacy"
     model_device: str = "auto"
+    model_num_threads: int | None = Field(default=None, ge=1, le=32)
     load_models_on_startup: bool = True
 
     # Approved model delivery. Deployment follows CURRENT.json by default; a fixed
