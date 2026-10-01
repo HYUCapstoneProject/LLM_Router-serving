@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     embed_model_revision: str | None = "d4aa6901d3a41ba39fb536a557fa166f842b0e09"
     embed_model_version: str = "bge-large-en-v1.5"
     embed_expected_dim: int = 1024
+    # Also the service input limit: /router/embed and /router/classify reject a
+    # message longer than this in BGE tokens, so cache and router see the whole
+    # question. The router package keeps its own (longer) inference length.
     embed_max_length: int = 512
     embed_local_files_only: bool = False
 
