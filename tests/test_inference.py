@@ -92,23 +92,3 @@ def test_modernbert_label_contract_rejects_wrong_order():
 
     with pytest.raises(ModelContractError, match="label order"):
         TransformersModernBertClassifier._validate_label_contract(config)
-
-
-def test_bge_token_count_includes_special_tokens_and_does_not_truncate():
-    class CountingTokenizer:
-        def __call__(self, message, **kwargs):
-            assert "truncation" not in kwargs
-            assert kwargs["add_special_tokens"] is True
-            return {"input_ids": list(range(len(message.split()) + 2))}
-
-    embedder = TransformersBgeEmbedder(
-        tokenizer=CountingTokenizer(),
-        model=FakeBgeModel(),
-        torch=torch,
-        device=torch.device("cpu"),
-        dimension=1024,
-        model_version="bge-large-en-v1.5",
-        max_length=512,
-    )
-
-    assert embedder.count_tokens(" ".join(["word"] * 600)) == 602

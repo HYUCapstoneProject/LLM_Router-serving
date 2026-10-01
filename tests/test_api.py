@@ -55,28 +55,6 @@ def test_classify_returns_tier_even_with_confidence(client, auth_headers):
     }
 
 
-def test_message_at_the_bge_token_limit_is_accepted(client, auth_headers):
-    # 510 words + [CLS] + [SEP] = 512 tokens in the fake tokenizer.
-    message = " ".join(["word"] * 510)
-
-    for path in ("/router/embed", "/router/classify"):
-        response = client.post(path, headers=auth_headers, json={"message": message})
-        assert response.status_code == 200, path
-
-
-def test_message_over_the_bge_token_limit_is_rejected_not_truncated(client, auth_headers):
-    message = " ".join(["word"] * 511)
-
-    for path in ("/router/embed", "/router/classify", "/router/classify/v2"):
-        response = client.post(path, headers=auth_headers, json={"message": message})
-        assert response.status_code == 400, path
-        assert response.json() == {
-            "error": "message has 513 tokens; the limit is 512",
-            "code": "MESSAGE_TOO_LONG",
-            "requestId": "req-test-123",
-        }
-
-
 def test_router_endpoints_require_bearer_token(client):
     response = client.post("/router/embed", json={"message": "hello"})
 

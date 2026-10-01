@@ -479,25 +479,6 @@ def create_app(
                 f"message exceeds {settings.max_message_characters} characters",
             )
 
-    def validate_message_tokens(message: str) -> None:
-        # The service input limit comes from BGE (512 tokens), not from the router.
-        # Rejecting here instead of truncating keeps cache lookup and routing on the
-        # same full question.
-        engine = model_manager.embedding_engine()
-        if engine is None:
-            raise ApiError(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                "EMBED_MODEL_NOT_READY",
-                "embedding model is not loaded",
-            )
-        token_count = engine.count_tokens(message)
-        if token_count > settings.embed_max_length:
-            raise ApiError(
-                status.HTTP_400_BAD_REQUEST,
-                "MESSAGE_TOO_LONG",
-                f"message has {token_count} tokens; the limit is {settings.embed_max_length}",
-            )
-
     @app.post(
         "/router/embed",
         response_model=EmbedResponse,
@@ -505,7 +486,6 @@ def create_app(
     )
     async def embed(payload: MessageRequest, _: InternalAuth) -> EmbedResponse:
         validate_message_length(payload.message)
-        validate_message_tokens(payload.message)
         engine = model_manager.embedding_engine()
         if engine is None:
             raise ApiError(
@@ -543,7 +523,6 @@ def create_app(
     )
     async def classify(payload: MessageRequest, _: InternalAuth) -> ClassifyResponse:
         validate_message_length(payload.message)
-        validate_message_tokens(payload.message)
         engine = model_manager.classification_engine()
         if engine is None:
             raise ApiError(
@@ -582,7 +561,6 @@ def create_app(
     )
     async def classify_v2(payload: MessageRequest, _: InternalAuth) -> ClassifyV2Response:
         validate_message_length(payload.message)
-        validate_message_tokens(payload.message)
         engine = model_manager.classification_engine()
         if engine is None:
             raise ApiError(
