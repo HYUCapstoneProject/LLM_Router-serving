@@ -74,10 +74,6 @@ class FakeEmbedder:
     dimension = 1024
     model_version = "bge-large-en-v1.5"
 
-    def count_tokens(self, message: str) -> int:
-        # One token per word plus [CLS] and [SEP].
-        return len(message.split()) + 2
-
     def embed(self, message: str) -> EmbeddingResult:
         vector = [0.0] * self.dimension
         vector[0] = 1.0

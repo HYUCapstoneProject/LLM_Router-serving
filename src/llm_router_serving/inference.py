@@ -52,8 +52,6 @@ class EmbeddingEngine(Protocol):
     dimension: int
     model_version: str
 
-    def count_tokens(self, message: str) -> int: ...
-
     def embed(self, message: str) -> EmbeddingResult: ...
 
 
@@ -148,10 +146,6 @@ class TransformersBgeEmbedder:
             model_version=model_version,
             max_length=max_length,
         )
-
-    def count_tokens(self, message: str) -> int:
-        """Token count as the embedder sees it, special tokens included."""
-        return len(self._tokenizer(message, add_special_tokens=True)["input_ids"])
 
     def embed(self, message: str) -> EmbeddingResult:
         inputs = self._tokenizer(

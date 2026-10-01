@@ -33,8 +33,6 @@ Spring은 pgvector 조회, cache threshold/hit/miss, 실제 provider 모델 ID·
 
 요청은 `{ "message": "How does photosynthesis work?" }`다. 공백이 아닌 문자열이며 기본 문자 상한은 100,000이다. 초과·누락·잘못된 필드는 `400 INVALID_MESSAGE`다.
 
-서비스 입력 상한은 BGE 토크나이저 기준 512 token(특수 토큰 포함, `embed_max_length`)이다. 넘으면 자르지 않고 `400 MESSAGE_TOO_LONG`으로 거절한다. 캐시 임베딩이 질문 앞 512 token만 보고 뒤를 버리면 뒷부분만 다른 긴 질문끼리 캐시 오탐이 나기 때문이다. `/router/classify`와 `/router/classify/v2`도 같은 BGE token 수로 같은 상한을 적용해, 캐시를 끈 구성에서도 캐시와 분류가 같은 질문 전체를 본다. 이 검사는 BGE 토크나이저를 쓰므로 BGE가 적재되지 않았으면 분류도 `503 EMBED_MODEL_NOT_READY`다. 라우터 패키지의 추론 길이(8,192)와 학습·평가 길이는 바꾸지 않는다. 이 상한은 서비스 입력 정책이지 모델 한계가 아니다.
-
 응답은 `embedding: number[]`, `dim: integer`, `modelVersion: string`이다. 현재 BGE 출력은 L2 정규화한 유한수 1,024개, `dim=1024`다. BGE는 CLS pooling, prefix 없이 기본 512 token까지 입력한다. `modelVersion`은 설정에서 정한 값으로 revision suffix를 자동 생성하지 않는다. Spring은 embedding version이 다른 vector를 같은 cache namespace에서 비교하지 않는다.
 
 ### `POST /router/rerank`
@@ -269,7 +267,6 @@ validatedUniqueBatch는 canonical batch digest를 이용하는 대안 정책이�
 | HTTP / code | 처리 |
 | --- | --- |
 | 400 `INVALID_MESSAGE` | message 또는 rerank 문자열 길이 수정 |
-| 400 `MESSAGE_TOO_LONG` | 질문이 BGE 512 token 초과. 폴백하지 않고 사용자에게 줄이도록 안내 |
 | 400 `TOO_MANY_CANDIDATES` | 설정 후보 상한에 맞춤 |
 | 401 `UNAUTHORIZED` | 내부/developer credential 또는 GCS identity 점검 |
 | 403 `FORBIDDEN` | developer 비활성 또는 Vertex/GCS IAM 점검 |
