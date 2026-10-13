@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     # Pin this to the exact checkpoint the threshold was measured on. A threshold
     # is only meaningful for one set of weights.
     rerank_model_version: str | None = None
+    # How the checkpoint is scored. `cross_encoder` is a one-logit duplicate model
+    # (sigmoid); `nli` is an NLI head scored by bidirectional entailment on the
+    # sentences the two texts do not share. Each needs its own measured threshold.
+    rerank_kind: Literal["cross_encoder", "nli"] = "cross_encoder"
     rerank_max_length: int = 512
     rerank_max_candidates: int = 16
     # The image bakes the weights in and the runtime is HF_HUB_OFFLINE=1,
