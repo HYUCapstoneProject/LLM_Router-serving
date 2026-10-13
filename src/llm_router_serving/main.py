@@ -22,6 +22,7 @@ from llm_router_serving.inference import (
     TransformersBgeEmbedder,
     TransformersCrossEncoderReranker,
     TransformersModernBertClassifier,
+    TransformersNliReranker,
 )
 from llm_router_serving.model_manager import ModelManager
 from llm_router_serving.model_source import (
@@ -213,7 +214,12 @@ def _build_model_manager(settings: Settings) -> ModelManager:
         )
 
     def load_rerank() -> RerankEngine:
-        return TransformersCrossEncoderReranker.load(
+        engine_class = (
+            TransformersNliReranker
+            if settings.rerank_kind == "nli"
+            else TransformersCrossEncoderReranker
+        )
+        return engine_class.load(
             model_id=str(settings.rerank_model_id),
             model_version=settings.rerank_model_version,
             max_length=settings.rerank_max_length,

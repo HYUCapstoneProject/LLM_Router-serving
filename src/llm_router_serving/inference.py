@@ -15,6 +15,7 @@ from llm_router_serving.routing_policy import (
     route_scores,
 )
 from llm_router_serving.schemas import RoutedModel, Tier
+from llm_router_serving.sentence_diff import reduce_pair
 
 # The embedder and the classifier are loaded concurrently on startup, each in its
 # own worker thread. `transformers` resolves its public names lazily, so two
@@ -472,4 +473,131 @@ class TransformersCrossEncoderReranker:
             raise ModelContractError(
                 f"reranker returned {len(scores)} scores for {len(candidates)} candidates"
             )
+        return RerankResult(scores=scores, model_version=self.model_version)
+
+
+class TransformersNliReranker:
+    """NLI verifier: a cached answer is reusable only if each question entails the other.
+
+    The quora cross-encoder learned "is this the same question". On questions where
+    one relation or condition flips (largest -> smallest, sum -> product) it still
+    scores the pair as a duplicate. An NLI model learned whether one statement
+    follows from the other, which is closer to "does this need the same answer".
+
+    Score per candidate, in [0, 1]:
+
+    1. ``sentence_diff.reduce_pair`` drops the sentences both texts share, so a long
+       prompt that changes one line is judged on that line instead of saturating.
+    2. Entailment probability (softmax over the NLI head) in both directions, in one
+       forward pass, so the gateway pays a single round trip.
+    3. The lower of the two. A condition present on only one side breaks one
+       direction, and that is enough to refuse the reuse.
+
+    **Scoring must reproduce the offline evaluation exactly**: the threshold was
+    measured with ``sentence_transformers.CrossEncoder.predict(apply_softmax=True)``
+    on the reduced pairs. ``scripts/verify_nli_parity.py`` replays those pairs.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokenizer: Any,
+        model: Any,
+        torch: Any,
+        device: Any,
+        model_version: str,
+        max_length: int,
+        entailment_index: int,
+    ) -> None:
+        self._tokenizer = tokenizer
+        self._model = model
+        self._torch = torch
+        self._device = device
+        self.model_version = model_version
+        self._max_length = max_length
+        self._entailment_index = entailment_index
+
+    @classmethod
+    def load(
+        cls,
+        *,
+        model_id: str,
+        model_version: str | None,
+        max_length: int,
+        device_name: str,
+        local_files_only: bool = True,
+    ) -> TransformersNliReranker:
+        with _TRANSFORMERS_IMPORT_LOCK:
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=local_files_only)
+        # Some NLI checkpoints are stored in float16. CPU float16 is an order of
+        # magnitude slower and scores differently from the float32 evaluation.
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_id, local_files_only=local_files_only, torch_dtype=torch.float32
+        )
+        entailment_index = cls._entailment_index(model.config)
+        device = resolve_torch_device(torch, device_name)
+        model.to(device)
+        model.eval()
+        return cls(
+            tokenizer=tokenizer,
+            model=model,
+            torch=torch,
+            device=device,
+            model_version=model_version or model_id,
+            max_length=max_length,
+            entailment_index=entailment_index,
+        )
+
+    @staticmethod
+    def _entailment_index(config: Any) -> int:
+        """Find the entailment logit by label name, never by position.
+
+        Checkpoints disagree on label order (contradiction/entailment/neutral vs
+        entailment/neutral/contradiction). Reading the wrong column would return
+        plausible-looking probabilities that mean something else, so refuse a head
+        without an unambiguous entailment label.
+        """
+        labels = {
+            int(index): str(name).lower()
+            for index, name in (getattr(config, "id2label", None) or {}).items()
+        }
+        matches = [index for index, name in labels.items() if name == "entailment"]
+        if len(labels) < 2 or len(matches) != 1:
+            raise ModelContractError(
+                f"NLI checkpoint must expose exactly one 'entailment' label; found {labels}"
+            )
+        return matches[0]
+
+    def rerank(self, query: str, candidates: list[str]) -> RerankResult:
+        reduced = [reduce_pair(query, candidate) for candidate in candidates]
+        firsts = [a for a, _ in reduced] + [b for _, b in reduced]
+        seconds = [b for _, b in reduced] + [a for a, _ in reduced]
+        inputs = self._tokenizer(
+            firsts,
+            seconds,
+            padding=True,
+            truncation=True,
+            max_length=self._max_length,
+            return_tensors="pt",
+        )
+        inputs = {name: value.to(self._device) for name, value in inputs.items()}
+        with self._torch.inference_mode():
+            logits = self._model(**inputs).logits
+            entailment = self._torch.softmax(logits, dim=-1)[:, self._entailment_index]
+
+        values = entailment.tolist()
+        count = len(candidates)
+        if len(values) != 2 * count:
+            raise ModelContractError(
+                f"NLI model returned {len(values)} scores for {2 * count} directed pairs"
+            )
+        scores: list[float] = []
+        for forward, backward in zip(values[:count], values[count:], strict=True):
+            # Check both before min(): min(0.7, nan) is 0.7 and would hide the NaN.
+            if not (math.isfinite(forward) and math.isfinite(backward)):
+                raise ModelContractError("NLI model returned a non-finite score")
+            scores.append(float(min(forward, backward)))
         return RerankResult(scores=scores, model_version=self.model_version)

@@ -67,12 +67,14 @@ cp .env.example .env
 | --- | --- |
 | BGE | `BAAI/bge-large-en-v1.5`, revision `d4aa6901d3a41ba39fb536a557fa166f842b0e09`; CLS pooling, L2 정규화, 1,024차원, prefix 없음, 512 token truncation |
 | Router | R0·R1 신규 추론 목표 8,192; 명시적 길이 계약으로 실제 학습 길이와 분리 검증. 기존 v2 512 계약과 legacy v1 설정 호환 유지. [길이 계약](docs/api-contract.md#95-입력-정규화와-학습추론-길이-분리) |
-| Reranker | 기본 비활성; 이미지에 `cross-encoder/quora-distilroberta-base` revision `f62e7a4b20b97195c2868e53ec59126df5eac743` 포함, 최대 길이 512, 기본 후보 16개 |
+| Reranker | 기본 비활성; 이미지에 `cross-encoder/quora-distilroberta-base` revision `f62e7a4b20b97195c2868e53ec59126df5eac743`(`cross_encoder`)와 `tasksource/deberta-base-long-nli` revision `04dcf11f844b07bc57015169fca2b7d6df8299d5`(`nli`) 포함, 기본 후보 16개 |
 | 장치 | `LLM_ROUTER_MODEL_DEVICE=auto`: CUDA 사용 가능 시 CUDA, 아니면 CPU |
 
 `modelVersion`은 설정/패키지에서 반환하는 식별자다. embedding 출력에 revision이 자동으로 붙는다고 가정하지 않는다. 임베딩·reranker가 바뀌면 version 식별자와 Spring의 cache namespace/threshold를 함께 바꾼다.
 
 Reranker 사용은 `LLM_ROUTER_RERANK_MODEL_ID=/opt/models/quora-distilroberta-base`로 명시한다. 캐시 실험에서 threshold와 잘못된 재사용 비율을 검증하고 Spring의 실패→cache miss 처리를 연결한 배포에서 활성화한다.
+
+NLI 검증은 `LLM_ROUTER_RERANK_KIND=nli`, `LLM_ROUTER_RERANK_MODEL_ID=/opt/models/deberta-base-long-nli`, `LLM_ROUTER_RERANK_MODEL_VERSION=tasksource/deberta-base-long-nli@04dcf11`, `LLM_ROUTER_RERANK_MAX_LENGTH=1280`으로 켠다. 후보마다 두 텍스트가 공유하는 문장(대소문자·공백만 무시)을 빼고 남은 문장으로 양방향 함의 확률을 한 번의 forward로 계산해 낮은 쪽을 점수로 돌려준다. 응답 형식은 같고 점수 의미만 다르므로 Spring threshold도 함께 바꾼다(측정값 0.28154424, 코사인 1위 후보만 검증). 오프라인 점수 재현은 `scripts/verify_nli_parity.py`로 확인한다.
 
 ## 컨테이너와 모델 전달
 
