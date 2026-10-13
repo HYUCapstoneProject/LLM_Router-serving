@@ -11,7 +11,7 @@ ARG RERANK_MODEL_ID=cross-encoder/quora-distilroberta-base
 ARG RERANK_MODEL_REVISION=f62e7a4b20b97195c2868e53ec59126df5eac743
 
 # NLI verifier weights (LLM_ROUTER_RERANK_KIND=nli). Same reasoning: the cache
-# threshold 0.2815 was measured on this exact commit.
+# threshold 0.28154424 was measured on this exact commit.
 ARG NLI_MODEL_ID=tasksource/deberta-base-long-nli
 ARG NLI_MODEL_REVISION=04dcf11f844b07bc57015169fca2b7d6df8299d5
 

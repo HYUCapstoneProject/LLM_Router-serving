@@ -74,7 +74,7 @@ cp .env.example .env
 
 Reranker 사용은 `LLM_ROUTER_RERANK_MODEL_ID=/opt/models/quora-distilroberta-base`로 명시한다. 캐시 실험에서 threshold와 잘못된 재사용 비율을 검증하고 Spring의 실패→cache miss 처리를 연결한 배포에서 활성화한다.
 
-NLI 검증은 `LLM_ROUTER_RERANK_KIND=nli`, `LLM_ROUTER_RERANK_MODEL_ID=/opt/models/deberta-base-long-nli`, `LLM_ROUTER_RERANK_MODEL_VERSION=tasksource/deberta-base-long-nli@04dcf11`, `LLM_ROUTER_RERANK_MAX_LENGTH=1280`으로 켠다. 후보마다 두 텍스트가 공유하는 문장(대소문자·공백만 무시)을 빼고 남은 문장으로 양방향 함의 확률을 한 번의 forward로 계산해 낮은 쪽을 점수로 돌려준다. 응답 형식은 같고 점수 의미만 다르므로 Spring threshold도 함께 바꾼다(측정값 0.2815, 코사인 1위 후보만 검증). 오프라인 점수 재현은 `scripts/verify_nli_parity.py`로 확인한다.
+NLI 검증은 `LLM_ROUTER_RERANK_KIND=nli`, `LLM_ROUTER_RERANK_MODEL_ID=/opt/models/deberta-base-long-nli`, `LLM_ROUTER_RERANK_MODEL_VERSION=tasksource/deberta-base-long-nli@04dcf11`, `LLM_ROUTER_RERANK_MAX_LENGTH=1280`으로 켠다. 후보마다 두 텍스트가 공유하는 문장(대소문자·공백만 무시)을 빼고 남은 문장으로 양방향 함의 확률을 한 번의 forward로 계산해 낮은 쪽을 점수로 돌려준다. 응답 형식은 같고 점수 의미만 다르므로 Spring threshold도 함께 바꾼다(측정값 0.28154424, 코사인 1위 후보만 검증). 오프라인 점수 재현은 `scripts/verify_nli_parity.py`로 확인한다.
 
 ## 컨테이너와 모델 전달
 

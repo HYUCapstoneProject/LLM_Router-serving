@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay the offline NLI evaluation pairs and compare against the stored scores.
 
-The NLI cache threshold (0.2815) was measured with
+The NLI cache threshold (0.28154424) was measured with
 ``sentence_transformers.CrossEncoder.predict(apply_softmax=True)`` on pairs reduced
 by the experiment's ``diffpair.reduce_pair``. Serving reproduces both with plain
 ``transformers`` and ``sentence_diff.reduce_pair``. This checks that they agree:
@@ -36,7 +36,7 @@ def main() -> int:
     # Batching/padding noise is around 1e-6; a wrong column or activation moves
     # scores by 0.1 or more.
     parser.add_argument("--tolerance", type=float, default=1e-4)
-    parser.add_argument("--threshold", type=float, default=0.2815)
+    parser.add_argument("--threshold", type=float, default=0.28154424)
     parser.add_argument("--local-files-only", action="store_true", default=False)
     args = parser.parse_args()
 

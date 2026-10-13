@@ -34,7 +34,10 @@ def test_nothing_shared_returns_the_originals():
 
 
 def test_pure_insertion_keeps_context_so_neither_side_is_blank():
-    a, b = reduce_pair("Add two numbers. Return the sum.", "Add two numbers. Return the sum. Use C++.")
+    a, b = reduce_pair(
+        "Add two numbers. Return the sum.",
+        "Add two numbers. Return the sum. Use C++.",
+    )
     assert a and b
     assert b.endswith("Use C++.")
 
